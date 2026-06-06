@@ -33,6 +33,7 @@ PYTHONPATH="$WORKTREE_DIR${PYTHONPATH:+:$PYTHONPATH}" \
   --images-per-request "${VLLM_HFPROC_IMAGES_PER_REQUEST:-4}" \
   --width "${VLLM_HFPROC_IMAGE_WIDTH:-672}" \
   --height "${VLLM_HFPROC_IMAGE_HEIGHT:-896}" \
+  --text-tokens "${VLLM_HFPROC_TEXT_TOKENS:-1024}" \
   --workers "${VLLM_HFPROC_WORKERS:-4}" \
   --warmups "${VLLM_HFPROC_WARMUPS:-1}" \
   --repetitions "${VLLM_HFPROC_REPETITIONS:-2}"
