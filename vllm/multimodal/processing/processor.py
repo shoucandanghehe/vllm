@@ -1500,6 +1500,127 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             timing_ctx,
         ).mm_input
 
+
+    def prefill_cache_items(
+        self,
+        inputs: ProcessorInputs,
+        item_hashes: Sequence[str],
+        timing_ctx: TimingContext,
+    ) -> None:
+        """Process selected missing MM items and store them in the cache.
+
+        This is used when a request is waiting on one in-flight missing item
+        but owns another missing item.  The owned item can be preprocessed while
+        the request waits; the request then re-enters the normal cached path.
+        """
+        cache = self.cache
+        if cache is None:
+            return
+
+        selected_hashes = set(item_hashes)
+        if not selected_hashes:
+            return
+
+        with timing_ctx.record("get_mm_hashes"):
+            mm_hashes = inputs.get_mm_hashes(self.info.model_id)
+
+        selected_mm_hashes: MultiModalHashes = {}
+        selected_mm_data = dict[str, list[object]]()
+        for modality, hashes in mm_hashes.items():
+            modality_hashes: list[str] = []
+            modality_data: list[object] = []
+            for item_idx, item_hash in enumerate(hashes):
+                if item_hash not in selected_hashes:
+                    continue
+
+                data = inputs.mm_data_items[modality][item_idx]
+                if data is None:
+                    raise ValueError(
+                        f"Cache miss for {modality} at index {item_idx} "
+                        "but data is not provided."
+                    )
+
+                modality_hashes.append(item_hash)
+                modality_data.append(data)
+
+            if modality_hashes:
+                selected_mm_hashes[modality] = modality_hashes
+                selected_mm_data[modality] = modality_data
+
+        if not selected_mm_hashes:
+            return
+
+        with self._cache_lock, timing_ctx.record("get_cache_missing_items"):
+            selected_is_cached = {
+                modality: cache.is_cached(hashes)
+                for modality, hashes in selected_mm_hashes.items()
+            }
+
+        missing_hashes: MultiModalHashes = {}
+        missing_data = dict[str, list[object]]()
+        missing_is_cached: MultiModalIsCached = {}
+        for modality, hashes in selected_mm_hashes.items():
+            modality_missing_hashes: list[str] = []
+            modality_missing_data: list[object] = []
+            for item_hash, data, item_is_cached in zip(
+                hashes,
+                selected_mm_data[modality],
+                selected_is_cached[modality],
+            ):
+                if item_is_cached:
+                    continue
+
+                modality_missing_hashes.append(item_hash)
+                modality_missing_data.append(data)
+
+            if modality_missing_hashes:
+                missing_hashes[modality] = modality_missing_hashes
+                missing_data[modality] = modality_missing_data
+                missing_is_cached[modality] = [False] * len(
+                    modality_missing_hashes
+                )
+
+        if not missing_hashes:
+            return
+
+        missing_items = self.info.parse_mm_data(missing_data, validate=False)
+
+        with timing_ctx.record("apply_hf_processor"):
+            (
+                _,
+                mm_missing_processed_data,
+                _,
+            ) = self._apply_hf_processor_main(
+                prompt=inputs.prompt,
+                mm_items=missing_items,
+                hf_processor_mm_kwargs=inputs.hf_processor_mm_kwargs,
+                tokenization_kwargs=inputs.tokenization_kwargs,
+                enable_hf_prompt_update=False,
+            )
+
+        mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
+            mm_missing_processed_data,
+            self._get_mm_fields_config(
+                mm_missing_processed_data,
+                inputs.hf_processor_mm_kwargs,
+            ),
+        )
+
+        mm_missing_prompt_updates = self._get_mm_prompt_updates(
+            missing_items,
+            inputs.hf_processor_mm_kwargs,
+            mm_missing_kwargs,
+        )
+
+        with self._cache_lock, timing_ctx.record("merge_mm_kwargs"):
+            self._merge_mm_kwargs(
+                cache,
+                mm_hashes=missing_hashes,
+                mm_is_cached=missing_is_cached,
+                mm_missing_kwargs=mm_missing_kwargs,
+                mm_missing_prompt_updates=mm_missing_prompt_updates,
+            )
+
     def _recompute_cached_prompt_update(
         self,
         cached_update: ResolvedPromptUpdate,

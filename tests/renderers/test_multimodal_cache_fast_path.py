@@ -61,6 +61,14 @@ class _FakeProcessor:
             missing_hashes=[] if mm_input is not None else None,
         )
 
+    def prefill_cache_items(
+        self,
+        inputs: ProcessorInputs,
+        item_hashes: list[str],
+        timing_ctx: TimingContext,
+    ) -> None:
+        self.apply(inputs, timing_ctx)
+
     def apply(
         self,
         inputs: ProcessorInputs,
@@ -137,6 +145,32 @@ class _FakeSingleFlightProcessor:
             ),
         )
 
+    def prefill_cache_items(
+        self,
+        inputs: ProcessorInputs,
+        item_hashes: list[str],
+        timing_ctx: TimingContext,
+    ) -> None:
+        selected_hashes = {int(item_hash) for item_hash in item_hashes}
+        images = inputs.mm_data_items["images"]
+        with self.lock:
+            missing = [
+                image
+                for image in images
+                if image in selected_hashes and image not in self.cache
+            ]
+
+        for image in missing:
+            if image == 100:
+                self.first_started.set()
+                assert self.release_first.wait(timeout=5)
+            elif image == 101:
+                self.second_started.set()
+                assert self.release_second.wait(timeout=5)
+
+        with self.lock:
+            self.cache.update(missing)
+
     def apply(
         self,
         inputs: ProcessorInputs,
@@ -177,7 +211,7 @@ class _TestRenderer(BaseRenderer):
         raise NotImplementedError
 
 
-def _make_renderer(processor: _FakeProcessor):
+def _make_renderer(processor: _FakeProcessor, max_workers: int = 1):
     renderer: Any = object.__new__(_TestRenderer)
     renderer.api_process_rank = 0
     renderer._mm_req_counter = AtomicCounter()
@@ -204,9 +238,13 @@ def _make_renderer(processor: _FakeProcessor):
     )()
     renderer.get_mm_processor = lambda: processor
     renderer._mm_cache_inflight_futures = {}
-    executor = ThreadPoolExecutor(max_workers=1)
+    executor = ThreadPoolExecutor(max_workers=max_workers)
     renderer._process_multimodal_in_executor = make_async(
         renderer._process_multimodal,
+        executor=executor,
+    )
+    renderer._prefill_multimodal_cache_in_executor = make_async(
+        renderer._prefill_multimodal_cache,
         executor=executor,
     )
     renderer._test_executor = executor
@@ -308,4 +346,61 @@ async def test_duplicate_cache_miss_waits_for_inflight_owner():
         await first_task
         if "second_task" in locals():
             await second_task
+        renderer._test_executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_mixed_miss_prefills_owned_hash_while_waiting():
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    processor = _FakeSingleFlightProcessor(
+        first_started,
+        second_started,
+        release_first,
+        release_second,
+    )
+    renderer = _make_renderer(processor, max_workers=2)
+
+    first_task = asyncio.create_task(
+        renderer._process_multimodal_async(
+            [1],
+            {"images": (1, 2, 3, 100)},
+            mm_uuids=None,
+            mm_processor_kwargs=None,
+            tokenization_kwargs=None,
+        )
+    )
+
+    try:
+        assert await asyncio.to_thread(first_started.wait, 5)
+
+        mixed_task = asyncio.create_task(
+            renderer._process_multimodal_async(
+                [2],
+                {"images": (1, 2, 100, 101)},
+                mm_uuids=None,
+                mm_processor_kwargs=None,
+                tokenization_kwargs=None,
+            )
+        )
+
+        assert await asyncio.to_thread(second_started.wait, 5)
+        assert not mixed_task.done()
+
+        release_second.set()
+        await asyncio.sleep(0)
+        assert not mixed_task.done()
+
+        release_first.set()
+        mixed_result = await asyncio.wait_for(mixed_task, timeout=0.5)
+        assert mixed_result["prompt_token_ids"] == [2]
+        assert processor.apply_calls == 1
+    finally:
+        release_first.set()
+        release_second.set()
+        await first_task
+        if "mixed_task" in locals():
+            await mixed_task
         renderer._test_executor.shutdown(wait=True)

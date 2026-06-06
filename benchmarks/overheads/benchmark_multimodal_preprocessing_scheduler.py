@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import types
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple
@@ -90,6 +91,7 @@ class FakeProcessor:
         self.miss_cost_s = miss_cost_s
         self.apply_calls = 0
         self.try_apply_calls = 0
+        self.prefill_calls = 0
         self.apply_cache_hits = 0
         self.apply_cache_misses = 0
         self.new_images_processed = 0
@@ -132,6 +134,31 @@ class FakeProcessor:
                 self.get_cache_missing_hashes(inputs, timing_ctx)
             ),
         )
+
+    def prefill_cache_items(
+        self,
+        inputs: Any,
+        item_hashes: Sequence[str],
+        timing_ctx: Any,
+    ) -> None:
+        selected_hashes = {int(item_hash) for item_hash in item_hashes}
+        images = inputs.mm_data_items["images"]
+        with self.lock:
+            missing = [
+                image
+                for image in images
+                if image in selected_hashes and image not in self.cache
+            ]
+
+        if not missing:
+            return
+
+        self.prefill_calls += 1
+        time.sleep(self.miss_cost_s * len(missing))
+        with self.lock:
+            self.cache.update(missing)
+            self.new_images_processed += len(missing)
+
 
     def apply(
         self,
@@ -212,6 +239,10 @@ def make_renderer(
     executor = ThreadPoolExecutor(max_workers=max_workers)
     renderer._process_multimodal_in_executor = symbols.make_async(
         renderer._process_multimodal,
+        executor=executor,
+    )
+    renderer._prefill_multimodal_cache_in_executor = symbols.make_async(
+        renderer._prefill_multimodal_cache,
         executor=executor,
     )
     return renderer, executor
@@ -407,6 +438,10 @@ def summarize(
             sum(1 for result in results if result.completed_at_s <= 0.10)
         ),
         f"{prefix}_apply_calls": float(processor.apply_calls),
+        f"{prefix}_prefill_calls": float(processor.prefill_calls),
+        f"{prefix}_processor_work_calls": float(
+            processor.apply_calls + processor.prefill_calls
+        ),
         f"{prefix}_try_apply_calls": float(processor.try_apply_calls),
         f"{prefix}_apply_cache_hits": float(processor.apply_cache_hits),
         f"{prefix}_apply_cache_misses": float(processor.apply_cache_misses),
