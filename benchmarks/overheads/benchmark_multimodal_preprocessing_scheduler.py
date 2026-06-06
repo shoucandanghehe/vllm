@@ -244,6 +244,37 @@ def make_duplicate_partial_miss_workload(
     return specs, initial_cache
 
 
+
+def make_mixed_inflight_new_workload(
+    *,
+    mixed_requests: int,
+    hot_images: int,
+) -> tuple[list[RequestSpec], set[int]]:
+    initial_cache = set(range(hot_images))
+    shared_cold_image = hot_images
+    specs = [
+        RequestSpec(
+            idx=0,
+            kind="partial_miss",
+            images=(0, 1, 2, shared_cold_image),
+        )
+    ]
+    for idx in range(1, mixed_requests + 1):
+        base = idx % (hot_images - 2)
+        specs.append(
+            RequestSpec(
+                idx=idx,
+                kind="partial_miss",
+                images=(
+                    base,
+                    base + 1,
+                    shared_cold_image,
+                    shared_cold_image + idx,
+                ),
+            ))
+    return specs, initial_cache
+
+
 def make_cached_hol_workload(
     *,
     cached_requests: int,
@@ -414,6 +445,19 @@ async def run_once(args: argparse.Namespace) -> dict[str, float]:
         miss_cost_s=args.miss_cost,
     )
 
+    mixed_specs, mixed_cache = make_mixed_inflight_new_workload(
+        mixed_requests=args.mixed_requests,
+        hot_images=args.hot_images,
+    )
+    mixed_results, mixed_processor, mixed_wall_s = await run_workload(
+        symbols,
+        mixed_specs,
+        mixed_cache,
+        concurrency=args.concurrency,
+        renderer_workers=args.renderer_workers,
+        miss_cost_s=args.miss_cost,
+    )
+
     metrics = summarize(
         duplicate_results,
         duplicate_processor,
@@ -427,11 +471,19 @@ async def run_once(args: argparse.Namespace) -> dict[str, float]:
             cached_hol_wall_s,
             "cached_hol",
         ))
+    metrics.update(
+        summarize(
+            mixed_results,
+            mixed_processor,
+            mixed_wall_s,
+            "mixed",
+        ))
 
-    # Primary score: mean scheduler-ready latency for the duplicate partial-miss
-    # workload.  This captures whether requests sharing the same cold image are
-    # unnecessarily serialized behind unrelated multimodal preprocessing work.
-    metrics["mm_preprocess_ready_mean_ms"] = metrics["duplicate_mean_ms"]
+
+    # Primary score: mean scheduler-ready latency for the mixed in-flight/new
+    # miss workload.  This captures whether requests can preprocess their new
+    # missing item while waiting for a different in-flight cache miss.
+    metrics["mm_preprocess_ready_mean_ms"] = metrics["mixed_mean_ms"]
     return metrics
 
 
@@ -463,6 +515,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--unique-new-images", type=int, default=12)
     parser.add_argument("--repeats-per-new-image", type=int, default=6)
     parser.add_argument("--cached-hol-requests", type=int, default=71)
+    parser.add_argument("--mixed-requests", type=int, default=71)
     parser.add_argument("--repetitions", type=int, default=5)
     return parser.parse_args()
 

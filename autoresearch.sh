@@ -30,4 +30,5 @@ PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
   --unique-new-images "${VLLM_MM_SCHED_UNIQUE_NEW_IMAGES:-12}" \
   --repeats-per-new-image "${VLLM_MM_SCHED_REPEATS_PER_NEW_IMAGE:-6}" \
   --cached-hol-requests "${VLLM_MM_SCHED_CACHED_HOL_REQUESTS:-71}" \
+  --mixed-requests "${VLLM_MM_SCHED_MIXED_REQUESTS:-71}" \
   --repetitions "${VLLM_MM_SCHED_REPETITIONS:-5}"
