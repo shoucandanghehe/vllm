@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -110,6 +112,14 @@ class BaseRenderer(ABC, Generic[_T]):
         self._prefill_multimodal_cache_in_executor = make_async(
             self._prefill_multimodal_cache, executor=self._mm_executor
         )
+        self._trace_interval_s = float(
+            os.environ.get("VLLM_RENDER_TRACE_INTERVAL_S", "0") or 0
+        )
+        self._trace_lock = threading.Lock()
+        self._trace_last_log = time.monotonic()
+        self._trace_stage_secs: dict[str, list[float]] = {}
+        self._trace_counts: dict[str, int] = {}
+        self._trace_inflight: dict[str, int] = {}
         if mm_registry.supports_multimodal_inputs(config.model_config):
             mm_processor_cache = mm_registry.processor_cache_from_config(config)
 
@@ -162,6 +172,77 @@ class BaseRenderer(ABC, Generic[_T]):
             raise ValueError("Multi-modal processor not available for text-only models")
 
         return self.mm_processor
+
+    @staticmethod
+    def _trace_percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, round((len(ordered) - 1) * percentile))
+        return ordered[index]
+
+    def _trace_enabled(self) -> bool:
+        return getattr(self, "_trace_interval_s", 0.0) > 0
+
+    def _trace_maybe_log_locked(self) -> None:
+        now = time.monotonic()
+        if now - self._trace_last_log < self._trace_interval_s:
+            return
+
+        stage_parts = []
+        for stage, values in sorted(self._trace_stage_secs.items()):
+            if not values:
+                continue
+            stage_parts.append(
+                f"{stage}(count={len(values)},"
+                f"p50={self._trace_percentile(values, 0.50):.3f}s,"
+                f"p95={self._trace_percentile(values, 0.95):.3f}s,"
+                f"max={max(values):.3f}s)"
+            )
+
+        count_parts = [
+            f"{name}={value}"
+            for name, value in sorted(self._trace_counts.items())
+            if value
+        ]
+        inflight_parts = [
+            f"{name}={value}"
+            for name, value in sorted(self._trace_inflight.items())
+            if value
+        ]
+
+        logger.info(
+            "Renderer trace rank=%s inflight=[%s] counts=[%s] timings=[%s]",
+            self.api_process_rank,
+            ", ".join(inflight_parts),
+            ", ".join(count_parts),
+            "; ".join(stage_parts),
+        )
+
+        self._trace_last_log = now
+        self._trace_stage_secs.clear()
+        self._trace_counts.clear()
+
+    def _trace_timing(self, stage: str, elapsed_s: float) -> None:
+        if not self._trace_enabled():
+            return
+        with self._trace_lock:
+            self._trace_stage_secs.setdefault(stage, []).append(elapsed_s)
+            self._trace_maybe_log_locked()
+
+    def _trace_count(self, name: str, delta: int = 1) -> None:
+        if not self._trace_enabled():
+            return
+        with self._trace_lock:
+            self._trace_counts[name] = self._trace_counts.get(name, 0) + delta
+            self._trace_maybe_log_locked()
+
+    def _trace_inflight_delta(self, name: str, delta: int) -> None:
+        if not self._trace_enabled():
+            return
+        with self._trace_lock:
+            self._trace_inflight[name] = self._trace_inflight.get(name, 0) + delta
+            self._trace_maybe_log_locked()
 
     @property
     def mm_processor_cache(self) -> "BaseMultiModalProcessorCache | None":
@@ -686,35 +767,48 @@ class BaseRenderer(ABC, Generic[_T]):
         *,
         skip_mm_cache: bool = False,
     ) -> "MultiModalInput":
-        mm_req_id = f"renderer{self.api_process_rank}-mm-{self._mm_req_counter.inc(1)}"
+        trace_start = time.perf_counter()
+        self._trace_inflight_delta("mm_executor", 1)
+        try:
+            mm_req_id = (
+                f"renderer{self.api_process_rank}-mm-{self._mm_req_counter.inc(1)}"
+            )
 
-        if skip_mm_cache and self._readonly_mm_processor is not None:
-            mm_processor = self._readonly_mm_processor
-        else:
-            mm_processor = self.get_mm_processor()
+            if skip_mm_cache and self._readonly_mm_processor is not None:
+                mm_processor = self._readonly_mm_processor
+            else:
+                mm_processor = self.get_mm_processor()
 
-        mm_data_items = mm_processor.info.parse_mm_data(mm_data)
-        mm_uuid_items = parse_mm_uuids(mm_uuids)
+            mm_data_items = mm_processor.info.parse_mm_data(mm_data)
+            mm_uuid_items = parse_mm_uuids(mm_uuids)
 
-        mm_uuid_items = self._process_mm_uuids(
-            mm_data, mm_data_items, mm_uuid_items, mm_req_id
-        )
+            mm_uuid_items = self._process_mm_uuids(
+                mm_data, mm_data_items, mm_uuid_items, mm_req_id
+            )
 
-        mm_processor_inputs = MMProcessorInputs(
-            prompt,
-            mm_data_items,
-            mm_uuid_items,
-            hf_processor_mm_kwargs=mm_processor_kwargs or {},
-            tokenization_kwargs=tokenization_kwargs or {},
-        )
-        mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
+            mm_processor_inputs = MMProcessorInputs(
+                prompt,
+                mm_data_items,
+                mm_uuid_items,
+                hf_processor_mm_kwargs=mm_processor_kwargs or {},
+                tokenization_kwargs=tokenization_kwargs or {},
+            )
+            mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
 
-        with set_default_torch_num_threads():
-            mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
+            apply_start = time.perf_counter()
+            with set_default_torch_num_threads():
+                mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
+            self._trace_timing(
+                "mm_executor_apply",
+                time.perf_counter() - apply_start,
+            )
 
-        self.update_mm_cache_stats()
+            self.update_mm_cache_stats()
 
-        return mm_inputs
+            return mm_inputs
+        finally:
+            self._trace_timing("mm_executor_total", time.perf_counter() - trace_start)
+            self._trace_inflight_delta("mm_executor", -1)
 
     def _get_mm_cache_waiters(
         self,
@@ -789,14 +883,20 @@ class BaseRenderer(ABC, Generic[_T]):
         item_hashes: Sequence[str],
         mm_timing_ctx: "TimingContext",
     ) -> None:
-        with set_default_torch_num_threads():
-            mm_processor.prefill_cache_items(
-                mm_processor_inputs,
-                item_hashes,
-                mm_timing_ctx,
-            )
+        trace_start = time.perf_counter()
+        self._trace_inflight_delta("mm_prefill_executor", 1)
+        try:
+            with set_default_torch_num_threads():
+                mm_processor.prefill_cache_items(
+                    mm_processor_inputs,
+                    item_hashes,
+                    mm_timing_ctx,
+                )
 
-        self.update_mm_cache_stats()
+            self.update_mm_cache_stats()
+        finally:
+            self._trace_timing("mm_prefill_total", time.perf_counter() - trace_start)
+            self._trace_inflight_delta("mm_prefill_executor", -1)
 
     async def _process_multimodal_async(
         self,
@@ -808,98 +908,134 @@ class BaseRenderer(ABC, Generic[_T]):
         *,
         skip_mm_cache: bool = False,
     ) -> "MultiModalInput":
-        mm_req_id = f"renderer{self.api_process_rank}-mm-{self._mm_req_counter.inc(1)}"
+        trace_start = time.perf_counter()
+        self._trace_inflight_delta("mm_async", 1)
+        try:
+            setup_start = time.perf_counter()
+            mm_req_id = (
+                f"renderer{self.api_process_rank}-mm-{self._mm_req_counter.inc(1)}"
+            )
 
-        if skip_mm_cache and self._readonly_mm_processor is not None:
-            mm_processor = self._readonly_mm_processor
-        else:
-            mm_processor = self.get_mm_processor()
+            if skip_mm_cache and self._readonly_mm_processor is not None:
+                mm_processor = self._readonly_mm_processor
+            else:
+                mm_processor = self.get_mm_processor()
 
-        mm_data_items = mm_processor.info.parse_mm_data(mm_data)
-        mm_uuid_items = parse_mm_uuids(mm_uuids)
+            mm_data_items = mm_processor.info.parse_mm_data(mm_data)
+            mm_uuid_items = parse_mm_uuids(mm_uuids)
 
-        mm_uuid_items = self._process_mm_uuids(
-            mm_data, mm_data_items, mm_uuid_items, mm_req_id
-        )
+            mm_uuid_items = self._process_mm_uuids(
+                mm_data, mm_data_items, mm_uuid_items, mm_req_id
+            )
 
-        mm_processor_inputs = MMProcessorInputs(
-            prompt,
-            mm_data_items,
-            mm_uuid_items,
-            hf_processor_mm_kwargs=mm_processor_kwargs or {},
-            tokenization_kwargs=tokenization_kwargs or {},
-        )
-        mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
+            mm_processor_inputs = MMProcessorInputs(
+                prompt,
+                mm_data_items,
+                mm_uuid_items,
+                hf_processor_mm_kwargs=mm_processor_kwargs or {},
+                tokenization_kwargs=tokenization_kwargs or {},
+            )
+            mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
+            self._trace_timing("mm_async_setup", time.perf_counter() - setup_start)
 
-        while True:
-            with set_default_torch_num_threads():
-                cached_result = mm_processor.try_apply_cached_or_get_missing_hashes(
-                    mm_processor_inputs,
-                    mm_timing_ctx,
-                )
+            while True:
+                probe_start = time.perf_counter()
+                with set_default_torch_num_threads():
+                    cached_result = (
+                        mm_processor.try_apply_cached_or_get_missing_hashes(
+                            mm_processor_inputs,
+                            mm_timing_ctx,
+                        )
+                    )
+                self._trace_timing("mm_cache_probe", time.perf_counter() - probe_start)
 
-            if cached_result.mm_input is not None:
-                self.update_mm_cache_stats()
-                return cached_result.mm_input
+                if cached_result.mm_input is not None:
+                    self._trace_count("mm_cache_hit")
+                    self.update_mm_cache_stats()
+                    return cached_result.mm_input
 
-            missing_hashes = cached_result.missing_hashes
-            if not missing_hashes:
-                reservations: list[tuple[str, asyncio.Future[None]]] = []
+                missing_hashes = cached_result.missing_hashes
+                if not missing_hashes:
+                    self._trace_count("mm_no_cache_or_passthrough")
+                    reservations: list[tuple[str, asyncio.Future[None]]] = []
+                    break
+
+                self._trace_count("mm_request_miss")
+                self._trace_count("mm_missing_hashes", len(missing_hashes))
+                waiters = self._get_mm_cache_waiters(missing_hashes)
+                if waiters:
+                    self._trace_count("mm_singleflight_wait_requests")
+                    self._trace_count("mm_singleflight_waiters", len(waiters))
+                    shielded_waiters = [asyncio.shield(waiter) for waiter in waiters]
+                    missing_without_waiters = self._get_unreserved_mm_cache_misses(
+                        missing_hashes
+                    )
+                    reservations = self._reserve_mm_cache_misses(
+                        missing_without_waiters
+                    )
+                    wait_start = time.perf_counter()
+                    if reservations:
+                        reserved_hashes = [
+                            item_hash for item_hash, _ in reservations
+                        ]
+                        self._trace_count("mm_prefill_submit")
+                        self._trace_count("mm_prefill_hashes", len(reserved_hashes))
+                        prefill_future = self._prefill_multimodal_cache_in_executor(
+                            mm_processor,
+                            mm_processor_inputs,
+                            reserved_hashes,
+                            mm_timing_ctx,
+                        )
+
+                        def release_prefill(
+                            _future: asyncio.Future[None],
+                            reservations=reservations,
+                        ) -> None:
+                            self._release_mm_cache_misses(reservations)
+
+                        prefill_future.add_done_callback(release_prefill)
+                        await asyncio.gather(
+                            *shielded_waiters,
+                            asyncio.shield(prefill_future),
+                        )
+                        self._trace_timing(
+                            "mm_wait_prefill",
+                            time.perf_counter() - wait_start,
+                        )
+                    else:
+                        await asyncio.gather(*shielded_waiters)
+                        self._trace_timing(
+                            "mm_singleflight_wait",
+                            time.perf_counter() - wait_start,
+                        )
+                    continue
+
+                reservations = self._reserve_mm_cache_misses(missing_hashes)
+                self._trace_count("mm_executor_submit")
+                self._trace_count("mm_executor_hashes", len(missing_hashes))
                 break
-            waiters = self._get_mm_cache_waiters(missing_hashes)
-            if waiters:
-                shielded_waiters = [
-                    asyncio.shield(waiter) for waiter in waiters
-                ]
-                missing_without_waiters = self._get_unreserved_mm_cache_misses(
-                    missing_hashes
+
+            mm_future = self._process_multimodal_in_executor(
+                prompt,
+                mm_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+                skip_mm_cache=skip_mm_cache,
+            )
+            await_start = time.perf_counter()
+            if not reservations:
+                result = await mm_future
+            else:
+                mm_future.add_done_callback(
+                    lambda _: self._release_mm_cache_misses(reservations)
                 )
-                reservations = self._reserve_mm_cache_misses(missing_without_waiters)
-                if reservations:
-                    reserved_hashes = [
-                        item_hash for item_hash, _ in reservations
-                    ]
-                    prefill_future = self._prefill_multimodal_cache_in_executor(
-                        mm_processor,
-                        mm_processor_inputs,
-                        reserved_hashes,
-                        mm_timing_ctx,
-                    )
-
-                    def release_prefill(
-                        _future: asyncio.Future[None],
-                        reservations=reservations,
-                    ) -> None:
-                        self._release_mm_cache_misses(reservations)
-
-                    prefill_future.add_done_callback(release_prefill)
-                    await asyncio.gather(
-                        *shielded_waiters,
-                        asyncio.shield(prefill_future),
-                    )
-                else:
-                    await asyncio.gather(*shielded_waiters)
-                continue
-
-            reservations = self._reserve_mm_cache_misses(missing_hashes)
-            break
-
-        mm_future = self._process_multimodal_in_executor(
-            prompt,
-            mm_data,
-            mm_processor_kwargs=mm_processor_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-            mm_uuids=mm_uuids,
-            skip_mm_cache=skip_mm_cache,
-        )
-        if not reservations:
-            return await mm_future
-
-        mm_future.add_done_callback(
-            lambda _: self._release_mm_cache_misses(reservations)
-        )
-
-        return await asyncio.shield(mm_future)
+                result = await asyncio.shield(mm_future)
+            self._trace_timing("mm_executor_await", time.perf_counter() - await_start)
+            return result
+        finally:
+            self._trace_timing("mm_async_total", time.perf_counter() - trace_start)
+            self._trace_inflight_delta("mm_async", -1)
 
     def _process_tokens(
         self,
@@ -1202,33 +1338,54 @@ class BaseRenderer(ABC, Generic[_T]):
         prompt_extras: dict[str, Any] | None = None,
         skip_mm_cache: bool = False,
     ):
-        arrival_time = time.time()
+        trace_start = time.perf_counter()
+        self._trace_inflight_delta("render_chat", 1)
+        try:
+            arrival_time = time.time()
 
-        if tok_params is None:
-            tok_params = self.default_chat_tok_params
+            if tok_params is None:
+                tok_params = self.default_chat_tok_params
 
-        rendered = [
-            self.render_messages_async(conversation, chat_params)
-            for conversation in conversations
-        ]
+            rendered = [
+                self.render_messages_async(conversation, chat_params)
+                for conversation in conversations
+            ]
 
-        out_conversations = list[list["ConversationMessage"]]()
-        dict_prompts = list[DictPrompt]()
-        for conv, prompt in await asyncio.gather(*rendered):
-            out_conversations.append(conv)
-            dict_prompts.append(prompt)
-
-        tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
-
-        self._apply_prompt_extras(tok_prompts, prompt_extras)
-
-        eng_prompts = await asyncio.gather(
-            *(
-                self.process_for_engine_async(
-                    p, arrival_time, skip_mm_cache=skip_mm_cache
-                )
-                for p in tok_prompts
+            render_start = time.perf_counter()
+            out_conversations = list[list["ConversationMessage"]]()
+            dict_prompts = list[DictPrompt]()
+            for conv, prompt in await asyncio.gather(*rendered):
+                out_conversations.append(conv)
+                dict_prompts.append(prompt)
+            self._trace_timing(
+                "render_messages_async",
+                time.perf_counter() - render_start,
             )
-        )
 
-        return out_conversations, eng_prompts
+            tokenize_start = time.perf_counter()
+            tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+            self._trace_timing(
+                "tokenize_prompts_async",
+                time.perf_counter() - tokenize_start,
+            )
+
+            self._apply_prompt_extras(tok_prompts, prompt_extras)
+
+            engine_start = time.perf_counter()
+            eng_prompts = await asyncio.gather(
+                *(
+                    self.process_for_engine_async(
+                        p, arrival_time, skip_mm_cache=skip_mm_cache
+                    )
+                    for p in tok_prompts
+                )
+            )
+            self._trace_timing(
+                "process_for_engine_async",
+                time.perf_counter() - engine_start,
+            )
+
+            return out_conversations, eng_prompts
+        finally:
+            self._trace_timing("render_chat_async", time.perf_counter() - trace_start)
+            self._trace_inflight_delta("render_chat", -1)
