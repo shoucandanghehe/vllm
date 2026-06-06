@@ -106,6 +106,19 @@ class FakeProcessor:
                 return None
         return self._result(inputs)
 
+    def get_cache_missing_hashes(
+        self,
+        inputs: Any,
+        timing_ctx: Any,
+    ) -> list[str] | None:
+        images = inputs.mm_data_items["images"]
+        with self.lock:
+            return [
+                str(image)
+                for image in images
+                if image not in self.cache
+            ]
+
     def apply(
         self,
         inputs: Any,
@@ -180,6 +193,7 @@ def make_renderer(
         {"multimodal_config": None},
     )()
     renderer.get_mm_processor = lambda: processor
+    renderer._mm_cache_inflight_futures = {}
 
     executor = ThreadPoolExecutor(max_workers=max_workers)
     renderer._process_multimodal_in_executor = symbols.make_async(

@@ -1355,6 +1355,43 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         timing_ctx.stage_secs[stage] = timing_ctx.stage_secs.get(stage, 0.0) + elapsed
 
+    def get_cache_missing_hashes(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> list[str] | None:
+        """Return missing processor-cache hashes for scheduler coordination.
+
+        The renderer uses this to avoid enqueueing duplicate requests for the
+        same missing multimodal item.  ``None`` means the request cannot use the
+        processor cache fast path, so the caller should fall back to the normal
+        processor path.
+        """
+        cache = self.cache
+
+        _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
+        if cache is None or passthrough_data:
+            return None
+
+        with timing_ctx.record("get_mm_hashes"):
+            mm_hashes = inputs.get_mm_hashes(self.info.model_id)
+
+        with self._cache_lock, timing_ctx.record("get_cache_missing_items"):
+            mm_is_cached = {
+                modality: cache.is_cached(hashes)
+                for modality, hashes in mm_hashes.items()
+            }
+
+        return [
+            item_hash
+            for modality, hashes in mm_hashes.items()
+            for item_hash, item_is_cached in zip(
+                hashes,
+                mm_is_cached[modality],
+            )
+            if not item_is_cached
+        ]
+
     def try_apply_cached(
         self,
         inputs: ProcessorInputs,

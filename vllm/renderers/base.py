@@ -93,6 +93,7 @@ class BaseRenderer(ABC, Generic[_T]):
         # in the event loop to avoid queueing behind expensive HF processing.
         self._mm_executor: Executor = self._executor
 
+        self._mm_cache_inflight_futures: dict[str, asyncio.Future[None]] = {}
         # Lazy initialization since offline LLM doesn't use async
         self._async_tokenizer: AsyncMicrobatchTokenizer | None = None
 
@@ -711,6 +712,55 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return mm_inputs
 
+    def _get_mm_cache_waiters(
+        self,
+        missing_hashes: Sequence[str],
+    ) -> list[asyncio.Future[None]]:
+        waiters: list[asyncio.Future[None]] = []
+        seen: set[str] = set()
+        for item_hash in missing_hashes:
+            if item_hash in seen:
+                continue
+            seen.add(item_hash)
+
+            waiter = self._mm_cache_inflight_futures.get(item_hash)
+            if waiter is not None:
+                waiters.append(waiter)
+
+        return waiters
+
+    def _reserve_mm_cache_misses(
+        self,
+        missing_hashes: Sequence[str],
+    ) -> list[tuple[str, asyncio.Future[None]]]:
+        loop = asyncio.get_running_loop()
+        reservations: list[tuple[str, asyncio.Future[None]]] = []
+        seen: set[str] = set()
+        for item_hash in missing_hashes:
+            if item_hash in seen:
+                continue
+            seen.add(item_hash)
+
+            if item_hash in self._mm_cache_inflight_futures:
+                continue
+
+            waiter = loop.create_future()
+            self._mm_cache_inflight_futures[item_hash] = waiter
+            reservations.append((item_hash, waiter))
+
+        return reservations
+
+    def _release_mm_cache_misses(
+        self,
+        reservations: Sequence[tuple[str, asyncio.Future[None]]],
+    ) -> None:
+        for item_hash, waiter in reservations:
+            if self._mm_cache_inflight_futures.get(item_hash) is waiter:
+                del self._mm_cache_inflight_futures[item_hash]
+
+            if not waiter.done():
+                waiter.set_result(None)
+
     async def _process_multimodal_async(
         self,
         prompt: list[int] | str,
@@ -744,17 +794,34 @@ class BaseRenderer(ABC, Generic[_T]):
         )
         mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
 
-        with set_default_torch_num_threads():
-            mm_inputs = mm_processor.try_apply_cached(
+        while True:
+            with set_default_torch_num_threads():
+                mm_inputs = mm_processor.try_apply_cached(
+                    mm_processor_inputs,
+                    mm_timing_ctx,
+                )
+
+            if mm_inputs is not None:
+                self.update_mm_cache_stats()
+                return mm_inputs
+
+            missing_hashes = mm_processor.get_cache_missing_hashes(
                 mm_processor_inputs,
                 mm_timing_ctx,
             )
+            if not missing_hashes:
+                reservations: list[tuple[str, asyncio.Future[None]]] = []
+                break
 
-        if mm_inputs is not None:
-            self.update_mm_cache_stats()
-            return mm_inputs
+            waiters = self._get_mm_cache_waiters(missing_hashes)
+            if waiters:
+                await asyncio.gather(*waiters)
+                continue
 
-        return await self._process_multimodal_in_executor(
+            reservations = self._reserve_mm_cache_misses(missing_hashes)
+            break
+
+        mm_future = self._process_multimodal_in_executor(
             prompt,
             mm_data,
             mm_processor_kwargs=mm_processor_kwargs,
@@ -762,6 +829,12 @@ class BaseRenderer(ABC, Generic[_T]):
             mm_uuids=mm_uuids,
             skip_mm_cache=skip_mm_cache,
         )
+        if reservations:
+            mm_future.add_done_callback(
+                lambda _: self._release_mm_cache_misses(reservations)
+            )
+
+        return await mm_future
 
     def _process_tokens(
         self,

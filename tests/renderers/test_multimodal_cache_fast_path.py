@@ -41,6 +41,14 @@ class _FakeProcessor:
             "mm_placeholders": {},
         }
 
+
+    def get_cache_missing_hashes(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ):
+        return None
+
     def apply(
         self,
         inputs: ProcessorInputs,
@@ -93,6 +101,7 @@ def _make_renderer(processor: _FakeProcessor):
         {"multimodal_config": None},
     )()
     renderer.get_mm_processor = lambda: processor
+    renderer._mm_cache_inflight_futures = {}
     executor = ThreadPoolExecutor(max_workers=1)
     renderer._process_multimodal_in_executor = make_async(
         renderer._process_multimodal,
