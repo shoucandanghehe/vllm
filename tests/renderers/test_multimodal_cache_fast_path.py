@@ -3,6 +3,7 @@
 
 import asyncio
 import threading
+import types
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -48,6 +49,17 @@ class _FakeProcessor:
         timing_ctx: TimingContext,
     ):
         return None
+
+    def try_apply_cached_or_get_missing_hashes(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ):
+        mm_input = self.try_apply_cached(inputs, timing_ctx)
+        return types.SimpleNamespace(
+            mm_input=mm_input,
+            missing_hashes=[] if mm_input is not None else None,
+        )
 
     def apply(
         self,
@@ -110,6 +122,20 @@ class _FakeSingleFlightProcessor:
                 for image in images
                 if image not in self.cache
             ]
+
+    def try_apply_cached_or_get_missing_hashes(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ):
+        mm_input = self.try_apply_cached(inputs, timing_ctx)
+        return types.SimpleNamespace(
+            mm_input=mm_input,
+            missing_hashes=(
+                [] if mm_input is not None else
+                self.get_cache_missing_hashes(inputs, timing_ctx)
+            ),
+        )
 
     def apply(
         self,

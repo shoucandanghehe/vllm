@@ -971,6 +971,11 @@ class MultiModalProcessingInfo(NamedTuple):
     prompt_updates: MultiModalPromptUpdates
 
 
+class MultiModalCachedApplyResult(NamedTuple):
+    mm_input: MultiModalInput | None
+    missing_hashes: list[str] | None
+
+
 class BaseMultiModalProcessor(ABC, Generic[_I]):
     """
     Abstract base class to process multi-modal inputs to be used in vLLM.
@@ -1355,33 +1360,11 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         timing_ctx.stage_secs[stage] = timing_ctx.stage_secs.get(stage, 0.0) + elapsed
 
-    def get_cache_missing_hashes(
-        self,
-        inputs: ProcessorInputs,
-        timing_ctx: TimingContext,
-    ) -> list[str] | None:
-        """Return missing processor-cache hashes for scheduler coordination.
-
-        The renderer uses this to avoid enqueueing duplicate requests for the
-        same missing multimodal item.  ``None`` means the request cannot use the
-        processor cache fast path, so the caller should fall back to the normal
-        processor path.
-        """
-        cache = self.cache
-
-        _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
-        if cache is None or passthrough_data:
-            return None
-
-        with timing_ctx.record("get_mm_hashes"):
-            mm_hashes = inputs.get_mm_hashes(self.info.model_id)
-
-        with self._cache_lock, timing_ctx.record("get_cache_missing_items"):
-            mm_is_cached = {
-                modality: cache.is_cached(hashes)
-                for modality, hashes in mm_hashes.items()
-            }
-
+    @staticmethod
+    def _get_missing_hashes(
+        mm_hashes: MultiModalHashes,
+        mm_is_cached: MultiModalIsCached,
+    ) -> list[str]:
         return [
             item_hash
             for modality, hashes in mm_hashes.items()
@@ -1392,24 +1375,21 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             if not item_is_cached
         ]
 
-    def try_apply_cached(
+    def try_apply_cached_or_get_missing_hashes(
         self,
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
-    ) -> MultiModalInput | None:
-        """Process inputs without offloading when every MM item is cached.
+    ) -> MultiModalCachedApplyResult:
+        """Return cached MM input, or missing hashes for single-flight waits.
 
-        The async renderer uses this as a fast path so cache-hit requests do
-        not wait behind cache-miss requests that are running the expensive HF
-        processor in the renderer executor.  It only succeeds when the request
-        can be served entirely from the processor cache; miss and passthrough
-        cases fall back to the normal executor path.
+        ``missing_hashes is None`` means this request cannot use the processor
+        cache fast path and must fall back to the normal processor path.
         """
         cache = self.cache
 
         _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
         if cache is None or passthrough_data:
-            return None
+            return MultiModalCachedApplyResult(None, None)
 
         start = time.perf_counter()
         mm_hashes = inputs.get_mm_hashes(self.info.model_id)
@@ -1424,8 +1404,9 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             )
             get_cache_missing_items_secs = time.perf_counter() - start
 
-            if self._has_cache_miss(mm_is_cached):
-                return None
+            missing_hashes = self._get_missing_hashes(mm_hashes, mm_is_cached)
+            if missing_hashes:
+                return MultiModalCachedApplyResult(None, missing_hashes)
 
             self._record_elapsed(
                 timing_ctx,
@@ -1482,13 +1463,42 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             prompt_updates=mm_prompt_updates,
         )
 
-        return self._build_mm_input_with_prompt_updates(
+        mm_input = self._build_mm_input_with_prompt_updates(
             prompt_ids,
             inputs,
             mm_info,
             is_update_applied,
             timing_ctx,
         )
+        return MultiModalCachedApplyResult(mm_input, [])
+
+    def get_cache_missing_hashes(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> list[str] | None:
+        return self.try_apply_cached_or_get_missing_hashes(
+            inputs,
+            timing_ctx,
+        ).missing_hashes
+
+    def try_apply_cached(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> MultiModalInput | None:
+        """Process inputs without offloading when every MM item is cached.
+
+        The async renderer uses this as a fast path so cache-hit requests do
+        not wait behind cache-miss requests that are running the expensive HF
+        processor in the renderer executor.  It only succeeds when the request
+        can be served entirely from the processor cache; miss and passthrough
+        cases fall back to the normal executor path.
+        """
+        return self.try_apply_cached_or_get_missing_hashes(
+            inputs,
+            timing_ctx,
+        ).mm_input
 
     def _recompute_cached_prompt_update(
         self,

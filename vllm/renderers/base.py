@@ -796,19 +796,16 @@ class BaseRenderer(ABC, Generic[_T]):
 
         while True:
             with set_default_torch_num_threads():
-                mm_inputs = mm_processor.try_apply_cached(
+                cached_result = mm_processor.try_apply_cached_or_get_missing_hashes(
                     mm_processor_inputs,
                     mm_timing_ctx,
                 )
 
-            if mm_inputs is not None:
+            if cached_result.mm_input is not None:
                 self.update_mm_cache_stats()
-                return mm_inputs
+                return cached_result.mm_input
 
-            missing_hashes = mm_processor.get_cache_missing_hashes(
-                mm_processor_inputs,
-                mm_timing_ctx,
-            )
+            missing_hashes = cached_result.missing_hashes
             if not missing_hashes:
                 reservations: list[tuple[str, asyncio.Future[None]]] = []
                 break

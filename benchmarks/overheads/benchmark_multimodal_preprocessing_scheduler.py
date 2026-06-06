@@ -119,6 +119,20 @@ class FakeProcessor:
                 if image not in self.cache
             ]
 
+    def try_apply_cached_or_get_missing_hashes(
+        self,
+        inputs: Any,
+        timing_ctx: Any,
+    ) -> types.SimpleNamespace:
+        mm_input = self.try_apply_cached(inputs, timing_ctx)
+        return types.SimpleNamespace(
+            mm_input=mm_input,
+            missing_hashes=(
+                [] if mm_input is not None else
+                self.get_cache_missing_hashes(inputs, timing_ctx)
+            ),
+        )
+
     def apply(
         self,
         inputs: Any,
