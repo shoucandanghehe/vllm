@@ -31,8 +31,8 @@ PYTHONPATH="$WORKTREE_DIR${PYTHONPATH:+:$PYTHONPATH}" \
 "$PYTHON" benchmarks/overheads/benchmark_qwen3_hf_processor.py \
   --requests "${VLLM_HFPROC_REQUESTS:-12}" \
   --images-per-request "${VLLM_HFPROC_IMAGES_PER_REQUEST:-4}" \
-  --width "${VLLM_HFPROC_IMAGE_WIDTH:-672}" \
-  --height "${VLLM_HFPROC_IMAGE_HEIGHT:-896}" \
+  --width "${VLLM_HFPROC_IMAGE_WIDTH:-1786}" \
+  --height "${VLLM_HFPROC_IMAGE_HEIGHT:-2526}" \
   --text-tokens "${VLLM_HFPROC_TEXT_TOKENS:-1024}" \
   --workers "${VLLM_HFPROC_WORKERS:-4}" \
   --warmups "${VLLM_HFPROC_WARMUPS:-1}" \
