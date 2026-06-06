@@ -829,12 +829,14 @@ class BaseRenderer(ABC, Generic[_T]):
             mm_uuids=mm_uuids,
             skip_mm_cache=skip_mm_cache,
         )
-        if reservations:
-            mm_future.add_done_callback(
-                lambda _: self._release_mm_cache_misses(reservations)
-            )
+        if not reservations:
+            return await mm_future
 
-        return await mm_future
+        mm_future.add_done_callback(
+            lambda _: self._release_mm_cache_misses(reservations)
+        )
+
+        return await asyncio.shield(mm_future)
 
     def _process_tokens(
         self,
