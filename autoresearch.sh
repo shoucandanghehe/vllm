@@ -24,7 +24,7 @@ TOKENIZERS_PARALLELISM=false \
 PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
 "$PYTHON" benchmarks/overheads/benchmark_multimodal_preprocessing_scheduler.py \
   --concurrency "${VLLM_MM_SCHED_CONCURRENCY:-72}" \
-  --renderer-workers "${VLLM_MM_SCHED_RENDERER_WORKERS:-1}" \
+  --renderer-workers "${VLLM_MM_SCHED_RENDERER_WORKERS:-4}" \
   --miss-cost "${VLLM_MM_SCHED_MISS_COST:-0.02}" \
   --hot-images "${VLLM_MM_SCHED_HOT_IMAGES:-256}" \
   --unique-new-images "${VLLM_MM_SCHED_UNIQUE_NEW_IMAGES:-12}" \
