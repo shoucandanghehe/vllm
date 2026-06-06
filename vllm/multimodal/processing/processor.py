@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Generator, ItemsView, Iterable, Mapping, Sequence
@@ -988,6 +990,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         self.info = info
         self.dummy_inputs = dummy_inputs
         self.cache = cache
+        self._cache_lock = threading.Lock()
 
         self.data_parser = self.info.get_data_parser()
 
@@ -1333,6 +1336,123 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         return mm_is_cached, mm_missing_items
 
+    @staticmethod
+    def _has_cache_miss(mm_is_cached: MultiModalIsCached) -> bool:
+        return any(
+            not item_is_cached
+            for modality_is_cached in mm_is_cached.values()
+            for item_is_cached in modality_is_cached
+        )
+
+    @staticmethod
+    def _record_elapsed(
+        timing_ctx: TimingContext,
+        stage: str,
+        elapsed: float,
+    ) -> None:
+        if not timing_ctx.enabled:
+            return
+
+        timing_ctx.stage_secs[stage] = timing_ctx.stage_secs.get(stage, 0.0) + elapsed
+
+    def try_apply_cached(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> MultiModalInput | None:
+        """Process inputs without offloading when every MM item is cached.
+
+        The async renderer uses this as a fast path so cache-hit requests do
+        not wait behind cache-miss requests that are running the expensive HF
+        processor in the renderer executor.  It only succeeds when the request
+        can be served entirely from the processor cache; miss and passthrough
+        cases fall back to the normal executor path.
+        """
+        cache = self.cache
+
+        _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
+        if cache is None or passthrough_data:
+            return None
+
+        start = time.perf_counter()
+        mm_hashes = inputs.get_mm_hashes(self.info.model_id)
+        get_mm_hashes_secs = time.perf_counter() - start
+
+        with self._cache_lock:
+            start = time.perf_counter()
+            mm_is_cached, mm_missing_data_items = self._get_cache_missing_items(
+                cache=cache,
+                mm_data_items=inputs.mm_data_items,
+                mm_hashes=mm_hashes,
+            )
+            get_cache_missing_items_secs = time.perf_counter() - start
+
+            if self._has_cache_miss(mm_is_cached):
+                return None
+
+            self._record_elapsed(
+                timing_ctx,
+                "get_mm_hashes",
+                get_mm_hashes_secs,
+            )
+            self._record_elapsed(
+                timing_ctx,
+                "get_cache_missing_items",
+                get_cache_missing_items_secs,
+            )
+
+            # NOTE: `prompt` does not correspond to the cached MM items, so use
+            # the same prompt-update-disabled path as `_cached_apply_hf_processor`.
+            with timing_ctx.record("apply_hf_processor"):
+                (
+                    prompt_ids,
+                    mm_missing_processed_data,
+                    is_update_applied,
+                ) = self._apply_hf_processor_main(
+                    prompt=inputs.prompt,
+                    mm_items=mm_missing_data_items,
+                    hf_processor_mm_kwargs=inputs.hf_processor_mm_kwargs,
+                    tokenization_kwargs=inputs.tokenization_kwargs,
+                    enable_hf_prompt_update=False,
+                )
+
+            mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
+                mm_missing_processed_data,
+                self._get_mm_fields_config(
+                    mm_missing_processed_data,
+                    inputs.hf_processor_mm_kwargs,
+                ),
+            )
+
+            mm_missing_prompt_updates = self._get_mm_prompt_updates(
+                mm_missing_data_items,
+                inputs.hf_processor_mm_kwargs,
+                mm_missing_kwargs,
+            )
+
+            with timing_ctx.record("merge_mm_kwargs"):
+                mm_kwargs, mm_prompt_updates = self._merge_mm_kwargs(
+                    cache,
+                    mm_hashes=mm_hashes,
+                    mm_is_cached=mm_is_cached,
+                    mm_missing_kwargs=mm_missing_kwargs,
+                    mm_missing_prompt_updates=mm_missing_prompt_updates,
+                )
+
+        mm_info = MultiModalProcessingInfo(
+            kwargs=mm_kwargs,
+            hashes=mm_hashes,
+            prompt_updates=mm_prompt_updates,
+        )
+
+        return self._build_mm_input_with_prompt_updates(
+            prompt_ids,
+            inputs,
+            mm_info,
+            is_update_applied,
+            timing_ctx,
+        )
+
     def _recompute_cached_prompt_update(
         self,
         cached_update: ResolvedPromptUpdate,
@@ -1456,7 +1576,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         with timing_ctx.record("get_mm_hashes"):
             mm_hashes = inputs.get_mm_hashes(self.info.model_id)
 
-        with timing_ctx.record("get_cache_missing_items"):
+        with self._cache_lock, timing_ctx.record("get_cache_missing_items"):
             mm_is_cached, mm_missing_data_items = self._get_cache_missing_items(
                 cache=cache,
                 mm_data_items=inputs.mm_data_items,
@@ -1492,7 +1612,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             mm_missing_kwargs,
         )
 
-        with timing_ctx.record("merge_mm_kwargs"):
+        with self._cache_lock, timing_ctx.record("merge_mm_kwargs"):
             mm_kwargs, mm_prompt_updates = self._merge_mm_kwargs(
                 cache,
                 mm_hashes=mm_hashes,
@@ -1684,6 +1804,22 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             is_update_applied,
         ) = self._cached_apply_hf_processor(inputs, timing_ctx)
 
+        return self._build_mm_input_with_prompt_updates(
+            prompt_ids,
+            inputs,
+            mm_info,
+            is_update_applied,
+            timing_ctx,
+        )
+
+    def _build_mm_input_with_prompt_updates(
+        self,
+        prompt_ids: list[int],
+        inputs: ProcessorInputs,
+        mm_info: MultiModalProcessingInfo,
+        is_update_applied: bool,
+        timing_ctx: TimingContext,
+    ) -> MultiModalInput:
         # NOTE: tokenization_kwargs are not required to init processor
         with timing_ctx.record("apply_prompt_updates"):
             prompt_ids, mm_placeholders = self._maybe_apply_prompt_updates(
