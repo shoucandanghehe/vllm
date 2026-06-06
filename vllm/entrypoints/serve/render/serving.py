@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Sequence
 from http import HTTPStatus
 from typing import Any, cast
@@ -193,6 +194,12 @@ class OpenAIServingRender:
         Called directly by render_chat_request and delegated to by
         OpenAIServingChat.render_chat_request after its engine-aware checks.
         """
+        trace_start = time.perf_counter()
+        self.renderer._trace_count("openai_chat_requests")
+        self.renderer._trace_count("openai_chat_messages", len(request.messages))
+        if request.stream:
+            self.renderer._trace_count("openai_chat_stream_requests")
+
         tokenizer = self.renderer.tokenizer
 
         tool_parser = self.tool_parser
@@ -247,6 +254,7 @@ class OpenAIServingRender:
             if error_check_ret is not None:
                 return error_check_ret
 
+            preprocess_start = time.perf_counter()
             conversation, engine_inputs = await self.preprocess_chat(
                 request,
                 request.messages,
@@ -258,12 +266,21 @@ class OpenAIServingRender:
                 skip_mm_cache=skip_mm_cache,
                 reasoning_parser=self.reasoning_parser,
             )
+            self.renderer._trace_timing(
+                "openai_preprocess_chat",
+                time.perf_counter() - preprocess_start,
+            )
         else:
             # For GPT-OSS.
             should_include_tools = tool_dicts is not None
             conversation, engine_inputs = self._make_request_with_harmony(
                 request, should_include_tools
             )
+
+        self.renderer._trace_timing(
+            "openai_render_chat_total",
+            time.perf_counter() - trace_start,
+        )
 
         return conversation, engine_inputs
 
@@ -537,6 +554,9 @@ class OpenAIServingRender:
     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
         """Copied from OpenAIServing._preprocess_chat."""
         renderer = self.renderer
+        renderer._trace_count("openai_preprocess_chat_requests")
+        renderer._trace_count("openai_preprocess_chat_messages", len(messages))
+
         mm_config = self.model_config.multimodal_config
 
         default_template_kwargs = merge_kwargs(
@@ -559,6 +579,7 @@ class OpenAIServingRender:
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
+        render_start = time.perf_counter()
         (conversation,), (engine_input,) = await renderer.render_chat_async(
             [messages],
             chat_params,
@@ -569,6 +590,10 @@ class OpenAIServingRender:
                 if (v := getattr(request, k, None)) is not None
             },
             skip_mm_cache=skip_mm_cache,
+        )
+        renderer._trace_timing(
+            "openai_renderer_render_chat_async",
+            time.perf_counter() - render_start,
         )
 
         if reasoning_parser is not None:

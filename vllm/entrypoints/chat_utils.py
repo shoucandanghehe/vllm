@@ -3,6 +3,9 @@
 
 import asyncio
 import json
+import os
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable
@@ -70,6 +73,97 @@ else:
     torch = LazyLoader("torch", globals(), "torch")
 
 logger = init_logger(__name__)
+
+_CHAT_PARSE_TRACE_LOCK = threading.Lock()
+_CHAT_PARSE_TRACE_LAST_LOG = time.monotonic()
+_CHAT_PARSE_TRACE_STAGE_SECS: dict[str, list[float]] = {}
+_CHAT_PARSE_TRACE_COUNTS: dict[str, int] = {}
+_CHAT_PARSE_TRACE_INFLIGHT: dict[str, int] = {}
+
+
+def _chat_parse_trace_interval_s() -> float:
+    return float(os.environ.get("VLLM_RENDER_TRACE_INTERVAL_S", "0") or 0)
+
+
+def _chat_parse_trace_enabled() -> bool:
+    return _chat_parse_trace_interval_s() > 0
+
+
+def _chat_parse_trace_percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, round((len(ordered) - 1) * percentile))
+    return ordered[index]
+
+
+def _chat_parse_trace_maybe_log_locked() -> None:
+    interval_s = _chat_parse_trace_interval_s()
+    now = time.monotonic()
+    global _CHAT_PARSE_TRACE_LAST_LOG
+    if now - _CHAT_PARSE_TRACE_LAST_LOG < interval_s:
+        return
+
+    stage_parts = []
+    for stage, values in sorted(_CHAT_PARSE_TRACE_STAGE_SECS.items()):
+        if not values:
+            continue
+        stage_parts.append(
+            f"{stage}(count={len(values)},"
+            f"p50={_chat_parse_trace_percentile(values, 0.50):.3f}s,"
+            f"p95={_chat_parse_trace_percentile(values, 0.95):.3f}s,"
+            f"max={max(values):.3f}s)"
+        )
+
+    count_parts = [
+        f"{name}={value}"
+        for name, value in sorted(_CHAT_PARSE_TRACE_COUNTS.items())
+        if value
+    ]
+    inflight_parts = [
+        f"{name}={value}"
+        for name, value in sorted(_CHAT_PARSE_TRACE_INFLIGHT.items())
+        if value
+    ]
+
+    logger.info(
+        "Chat parse trace inflight=[%s] counts=[%s] timings=[%s]",
+        ", ".join(inflight_parts),
+        ", ".join(count_parts),
+        "; ".join(stage_parts),
+    )
+
+    _CHAT_PARSE_TRACE_LAST_LOG = now
+    _CHAT_PARSE_TRACE_STAGE_SECS.clear()
+    _CHAT_PARSE_TRACE_COUNTS.clear()
+
+
+def _chat_parse_trace_timing(stage: str, elapsed_s: float) -> None:
+    if not _chat_parse_trace_enabled():
+        return
+    with _CHAT_PARSE_TRACE_LOCK:
+        _CHAT_PARSE_TRACE_STAGE_SECS.setdefault(stage, []).append(elapsed_s)
+        _chat_parse_trace_maybe_log_locked()
+
+
+def _chat_parse_trace_count(name: str, delta: int = 1) -> None:
+    if not _chat_parse_trace_enabled():
+        return
+    with _CHAT_PARSE_TRACE_LOCK:
+        _CHAT_PARSE_TRACE_COUNTS[name] = (
+            _CHAT_PARSE_TRACE_COUNTS.get(name, 0) + delta
+        )
+        _chat_parse_trace_maybe_log_locked()
+
+
+def _chat_parse_trace_inflight_delta(name: str, delta: int) -> None:
+    if not _chat_parse_trace_enabled():
+        return
+    with _CHAT_PARSE_TRACE_LOCK:
+        _CHAT_PARSE_TRACE_INFLIGHT[name] = (
+            _CHAT_PARSE_TRACE_INFLIGHT.get(name, 0) + delta
+        )
+        _chat_parse_trace_maybe_log_locked()
 
 
 class ChatTemplateResolutionError(ValueError):
@@ -1892,32 +1986,61 @@ async def parse_chat_messages_async(
     MultiModalDataDict | None,
     MultiModalUUIDDict | None,
 ]:
-    conversation: list[ConversationMessage] = []
-    mm_tracker = AsyncMultiModalItemTracker(
-        model_config,
-        media_io_kwargs=media_io_kwargs,
-    )
-
-    for msg in messages:
-        sub_messages = _parse_chat_message_content(
-            msg,
-            mm_tracker,
-            content_format,
-            interleave_strings=(
-                content_format == "string"
-                and model_config.multimodal_config is not None
-                and model_config.multimodal_config.interleave_mm_strings
-            ),
-            mm_processor_kwargs=mm_processor_kwargs,
+    trace_start = time.perf_counter()
+    _chat_parse_trace_inflight_delta("parse_chat_messages_async", 1)
+    try:
+        conversation: list[ConversationMessage] = []
+        mm_tracker = AsyncMultiModalItemTracker(
+            model_config,
+            media_io_kwargs=media_io_kwargs,
         )
 
-        conversation.extend(sub_messages)
+        _chat_parse_trace_count("parse_chat_requests")
+        _chat_parse_trace_count("parse_chat_messages", len(messages))
+        parse_start = time.perf_counter()
+        for msg in messages:
+            sub_messages = _parse_chat_message_content(
+                msg,
+                mm_tracker,
+                content_format,
+                interleave_strings=(
+                    content_format == "string"
+                    and model_config.multimodal_config is not None
+                    and model_config.multimodal_config.interleave_mm_strings
+                ),
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
 
-    _postprocess_messages(conversation)
+            conversation.extend(sub_messages)
 
-    mm_data, mm_uuids = await mm_tracker.resolve_items()
+        _postprocess_messages(conversation)
+        _chat_parse_trace_timing(
+            "parse_message_content",
+            time.perf_counter() - parse_start,
+        )
 
-    return conversation, mm_data, mm_uuids
+        resolve_start = time.perf_counter()
+        mm_data, mm_uuids = await mm_tracker.resolve_items()
+        _chat_parse_trace_timing(
+            "resolve_media_items",
+            time.perf_counter() - resolve_start,
+        )
+        if mm_data is not None:
+            _chat_parse_trace_count("parse_mm_requests")
+            for modality, modality_data in mm_data.items():
+                if isinstance(modality_data, list):
+                    item_count = len(modality_data)
+                else:
+                    item_count = 1
+                _chat_parse_trace_count(f"parse_mm_{modality}_items", item_count)
+
+        return conversation, mm_data, mm_uuids
+    finally:
+        _chat_parse_trace_timing(
+            "parse_chat_messages_async_total",
+            time.perf_counter() - trace_start,
+        )
+        _chat_parse_trace_inflight_delta("parse_chat_messages_async", -1)
 
 
 def get_history_tool_calls_cnt(conversation: list[ConversationMessage]):
