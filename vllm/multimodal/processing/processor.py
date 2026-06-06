@@ -1314,6 +1314,11 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             modality: cache.is_cached(hashes) for modality, hashes in mm_hashes.items()
         }
 
+        for modality, hashes in mm_hashes.items():
+            for item_hash, item_is_cached in zip(hashes, mm_is_cached[modality]):
+                if item_is_cached:
+                    cache.touch_sender_cache_item(item_hash)
+
         mm_missing_idxs = {
             modality: [
                 idx
