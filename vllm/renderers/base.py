@@ -846,9 +846,11 @@ class BaseRenderer(ABC, Generic[_T]):
             if not missing_hashes:
                 reservations: list[tuple[str, asyncio.Future[None]]] = []
                 break
-
             waiters = self._get_mm_cache_waiters(missing_hashes)
             if waiters:
+                shielded_waiters = [
+                    asyncio.shield(waiter) for waiter in waiters
+                ]
                 missing_without_waiters = self._get_unreserved_mm_cache_misses(
                     missing_hashes
                 )
@@ -863,6 +865,7 @@ class BaseRenderer(ABC, Generic[_T]):
                         reserved_hashes,
                         mm_timing_ctx,
                     )
+
                     def release_prefill(
                         _future: asyncio.Future[None],
                         reservations=reservations,
@@ -870,9 +873,12 @@ class BaseRenderer(ABC, Generic[_T]):
                         self._release_mm_cache_misses(reservations)
 
                     prefill_future.add_done_callback(release_prefill)
-                    await asyncio.gather(*waiters, asyncio.shield(prefill_future))
+                    await asyncio.gather(
+                        *shielded_waiters,
+                        asyncio.shield(prefill_future),
+                    )
                 else:
-                    await asyncio.gather(*waiters)
+                    await asyncio.gather(*shielded_waiters)
                 continue
 
             reservations = self._reserve_mm_cache_misses(missing_hashes)
