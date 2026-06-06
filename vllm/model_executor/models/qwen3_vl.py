@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BatchFeature
+from transformers.image_utils import SizeDict
 from transformers.models.qwen2_vl import Qwen2VLImageProcessorFast
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
     smart_resize as image_smart_resize,
@@ -369,8 +370,31 @@ class Qwen3_VisionPatchEmbed(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         L, C = x.shape
-        x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.hidden_size)
+        compact_image_patch_size = (
+            self.proj.in_channels * self.patch_size * self.patch_size
+        )
+        full_temporal_patch_size = compact_image_patch_size * self.temporal_patch_size
+
+        if compact_image_patch_size == C:
+            weight = self.proj.weight.sum(dim=2).reshape(
+                self.hidden_size, compact_image_patch_size
+            )
+            x = F.linear(x, weight, self.proj.bias)
+        elif full_temporal_patch_size == C:
+            x = x.view(
+                L,
+                -1,
+                self.temporal_patch_size,
+                self.patch_size,
+                self.patch_size,
+            )
+            x = self.proj(x).view(L, self.hidden_size)
+        else:
+            raise ValueError(
+                "Qwen3-VL patch input has unexpected flattened size "
+                f"{C}; expected {compact_image_patch_size} for compact images "
+                f"or {full_temporal_patch_size} for temporal inputs."
+            )
         return x
 
 
@@ -1203,6 +1227,190 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
 
 
 class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]):
+    @staticmethod
+    def _batch_same_size_rgb_pil_images(images: object) -> object:
+        from PIL import Image as PILImage
+
+        if not isinstance(images, (list, tuple)) or len(images) == 0:
+            return images
+
+        first = images[0]
+        if not isinstance(first, PILImage.Image) or first.mode != "RGB":
+            return images
+
+        width, height = first.size
+        tensors = []
+        for image in images:
+            if (
+                not isinstance(image, PILImage.Image)
+                or image.mode != "RGB"
+                or image.size != (width, height)
+            ):
+                return images
+            tensors.append(
+                torch.frombuffer(image.tobytes(), dtype=torch.uint8)
+                .view(height, width, 3)
+                .permute(2, 0, 1)
+            )
+
+        return torch.stack(tensors, dim=0)
+
+    @staticmethod
+    def _can_fast_preprocess_batched_images(
+        image_processor: Qwen2VLImageProcessorFast,
+        images: object,
+        processor_kwargs: Mapping[str, object],
+    ) -> bool:
+        if not isinstance(images, torch.Tensor):
+            return False
+        if images.ndim != 4 or images.dtype != torch.uint8:
+            return False
+
+        ignored_kwargs = {"disable_grouping"}
+        if any(key not in ignored_kwargs for key in processor_kwargs):
+            return False
+
+        if not image_processor.do_resize:
+            height, width = images.shape[-2:]
+            return height % image_processor.patch_size == 0 and (
+                width % image_processor.patch_size == 0
+            )
+
+        return True
+
+    @staticmethod
+    def _fast_preprocess_batched_images(
+        image_processor: Qwen2VLImageProcessorFast,
+        images: torch.Tensor,
+        return_tensors: str | None = None,
+        **kwargs: object,
+    ) -> BatchFeature:
+        patch_size = image_processor.patch_size
+        merge_size = image_processor.merge_size
+        if image_processor.do_resize:
+            height, width = images.shape[-2:]
+            resized_height, resized_width = image_smart_resize(
+                height,
+                width,
+                factor=patch_size * merge_size,
+                min_pixels=image_processor.size.shortest_edge,
+                max_pixels=image_processor.size.longest_edge,
+            )
+            if (resized_height, resized_width) != (height, width):
+                images = image_processor.resize(
+                    image=images,
+                    size=SizeDict(height=resized_height, width=resized_width),
+                    resample=image_processor.resample,
+                )
+
+        if (
+            image_processor.do_rescale
+            and image_processor.do_normalize
+            and float(image_processor.rescale_factor) == 1.0 / 255.0
+            and tuple(image_processor.image_mean) == (0.5, 0.5, 0.5)
+            and tuple(image_processor.image_std) == (0.5, 0.5, 0.5)
+        ):
+            patches = images.to(dtype=torch.float32)
+            patches.sub_(127.5).div_(127.5)
+        else:
+            patches = image_processor.rescale_and_normalize(
+                images,
+                image_processor.do_rescale,
+                image_processor.rescale_factor,
+                image_processor.do_normalize,
+                image_processor.image_mean,
+                image_processor.image_std,
+            )
+        batch_size, channel, height, width = patches.shape
+        grid_h = height // patch_size
+        grid_w = width // patch_size
+        patches = patches.view(
+            batch_size,
+            channel,
+            grid_h // merge_size,
+            merge_size,
+            patch_size,
+            grid_w // merge_size,
+            merge_size,
+            patch_size,
+        )
+        patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7).contiguous()
+        pixel_values = patches.view(
+            batch_size * grid_h * grid_w,
+            channel * patch_size * patch_size,
+        )
+        image_grid_thw = torch.tensor(
+            [[1, grid_h, grid_w]] * batch_size,
+            dtype=torch.long,
+        )
+        return BatchFeature(
+            data={
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+            },
+            tensor_type=return_tensors,
+        )
+
+
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        mm_counts = mm_items.get_all_counts()
+        if mm_counts.get("video", 0) > 0:
+            return super()._apply_hf_processor_mm_only(
+                mm_items,
+                hf_processor_mm_kwargs,
+                tokenization_kwargs,
+            )
+
+        valid_mm_items = mm_items.select(
+            {modality for modality, count in mm_counts.items() if count > 0}
+        )
+        processor_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        if set(processor_data) != {"images"}:
+            return super()._apply_hf_processor_mm_only(
+                mm_items,
+                hf_processor_mm_kwargs,
+                tokenization_kwargs,
+            )
+
+        batched_images = self._batch_same_size_rgb_pil_images(
+            processor_data["images"]
+        )
+        prebatched_images = batched_images is not processor_data["images"]
+        if prebatched_images:
+            processor_data = dict(processor_data)
+            processor_data["images"] = batched_images
+
+        processor_kwargs = dict(**hf_processor_mm_kwargs, **tokenization_kwargs)
+        if not prebatched_images:
+            processor_kwargs.setdefault("disable_grouping", False)
+        processor_kwargs.pop("return_mm_token_type_ids", None)
+        processor_kwargs.pop("return_token_type_ids", None)
+
+        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
+        if self._can_fast_preprocess_batched_images(
+            image_processor,
+            processor_data["images"],
+            processor_kwargs,
+        ):
+            processed_data = self.info.ctx.call_hf_processor(
+                partial(self._fast_preprocess_batched_images, image_processor),
+                processor_data,
+                processor_kwargs,
+            )
+        else:
+            processed_data = self.info.ctx.call_hf_processor(
+                image_processor,
+                processor_data,
+                processor_kwargs,
+            )
+        processed_data.update(passthrough_data)
+        return processed_data
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -1774,9 +1982,12 @@ class Qwen3VLForConditionalGeneration(
         # prune+append for video). The encoder CUDA graph path bypasses that
         # post-process, producing inconsistent embedding formats vs eager. So
         # disable CUDA graph for all modalities when pruning is on.
-        modalities = [] if self.is_multimodal_pruning_enabled else ["image", "video"]
+        modalities = [] if self.is_multimodal_pruning_enabled else ["video"]
 
-        # Compute max_frames_per_video for budget sizing.
+        # Compact image patches have a different per-patch width than videos.
+        # The current encoder CUDA graph manager captures one shared input
+        # buffer for image and video, so keep CUDA graph capture on the
+        # unchanged video path and route images through eager vision forward.
         max_frames = self.get_max_frames_per_video() if "video" in modalities else 1
 
         return EncoderCudaGraphConfig(
