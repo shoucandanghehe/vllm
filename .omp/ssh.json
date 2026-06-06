@@ -1,0 +1,10 @@
+{
+  "hosts": {
+    "autodl-rtx6000": {
+      "host": "connect.cqa1.seetacloud.com",
+      "username": "root",
+      "port": 46599,
+      "keyPath": "/home/scdhh/KEY/PC"
+    }
+  }
+}

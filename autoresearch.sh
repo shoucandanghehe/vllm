@@ -2,17 +2,20 @@
 set -euo pipefail
 
 ROOT_DIR=$(dirname "$(readlink -f "$0")")
-cd "$ROOT_DIR"
+WORKTREE_DIR="${VLLM_HFPROC_WORKTREE:-$ROOT_DIR/.worktrees/hf-processor-opt}"
+cd "$WORKTREE_DIR"
 
 if [[ -n "${VLLM_BENCH_PYTHON:-}" ]]; then
   PYTHON="$VLLM_BENCH_PYTHON"
+elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON="$ROOT_DIR/.venv/bin/python"
+elif [[ -x ".venv/bin/python" ]]; then
+  PYTHON=".venv/bin/python"
 else
   UV_TOOL_DIR=$(uv tool dir)
   TOOL_PYTHON="$UV_TOOL_DIR/vllm/bin/python"
   if [[ -x "$TOOL_PYTHON" ]]; then
     PYTHON="$TOOL_PYTHON"
-  elif [[ -x ".venv/bin/python" ]]; then
-    PYTHON=".venv/bin/python"
   else
     echo "No benchmark Python found. Set VLLM_BENCH_PYTHON or install vLLM via uv tool." >&2
     exit 1
@@ -21,14 +24,15 @@ fi
 
 PYTHONHASHSEED=0 \
 TOKENIZERS_PARALLELISM=false \
-PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-"$PYTHON" benchmarks/overheads/benchmark_multimodal_preprocessing_scheduler.py \
-  --concurrency "${VLLM_MM_SCHED_CONCURRENCY:-72}" \
-  --renderer-workers "${VLLM_MM_SCHED_RENDERER_WORKERS:-4}" \
-  --miss-cost "${VLLM_MM_SCHED_MISS_COST:-0.02}" \
-  --hot-images "${VLLM_MM_SCHED_HOT_IMAGES:-256}" \
-  --unique-new-images "${VLLM_MM_SCHED_UNIQUE_NEW_IMAGES:-12}" \
-  --repeats-per-new-image "${VLLM_MM_SCHED_REPEATS_PER_NEW_IMAGE:-6}" \
-  --cached-hol-requests "${VLLM_MM_SCHED_CACHED_HOL_REQUESTS:-71}" \
-  --mixed-requests "${VLLM_MM_SCHED_MIXED_REQUESTS:-71}" \
-  --repetitions "${VLLM_MM_SCHED_REPETITIONS:-5}"
+OMP_NUM_THREADS="${VLLM_HFPROC_OMP_NUM_THREADS:-1}" \
+MKL_NUM_THREADS="${VLLM_HFPROC_MKL_NUM_THREADS:-1}" \
+OPENBLAS_NUM_THREADS="${VLLM_HFPROC_OPENBLAS_NUM_THREADS:-1}" \
+PYTHONPATH="$WORKTREE_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+"$PYTHON" benchmarks/overheads/benchmark_qwen3_hf_processor.py \
+  --requests "${VLLM_HFPROC_REQUESTS:-12}" \
+  --images-per-request "${VLLM_HFPROC_IMAGES_PER_REQUEST:-4}" \
+  --width "${VLLM_HFPROC_IMAGE_WIDTH:-672}" \
+  --height "${VLLM_HFPROC_IMAGE_HEIGHT:-896}" \
+  --workers "${VLLM_HFPROC_WORKERS:-4}" \
+  --warmups "${VLLM_HFPROC_WARMUPS:-1}" \
+  --repetitions "${VLLM_HFPROC_REPETITIONS:-2}"
