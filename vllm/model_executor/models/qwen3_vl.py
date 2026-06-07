@@ -1226,6 +1226,94 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
         return video_items
 
 
+_QWEN3_VL_FUSED_COMPACT_PREPROCESS_NATIVE: Callable[
+    [
+        torch.Tensor,
+        Sequence[float],
+        Sequence[float],
+        float,
+        int,
+        int,
+    ],
+    torch.Tensor,
+] | None = None
+
+
+def _qwen3_vl_fused_compact_preprocess_uint8_bchw(
+    images: torch.Tensor,
+    image_mean: Sequence[float],
+    image_std: Sequence[float],
+    rescale_factor: float,
+    patch_size: int,
+    merge_size: int,
+) -> torch.Tensor:
+    """Normalize and patchify Qwen3-VL image tensors into compact patches.
+
+    Native hook signature:
+        (uint8_bchw, image_mean, image_std, rescale_factor, patch_size,
+         merge_size) -> float32 [N, C*P*P]
+
+    The Python fallback keeps B's compact image-patch contract while avoiding
+    the full intermediate normalized BCHW tensor.
+    """
+    if _QWEN3_VL_FUSED_COMPACT_PREPROCESS_NATIVE is not None:
+        return _QWEN3_VL_FUSED_COMPACT_PREPROCESS_NATIVE(
+            images,
+            image_mean,
+            image_std,
+            rescale_factor,
+            patch_size,
+            merge_size,
+        )
+
+    batch_size, channel, height, width = images.shape
+    grid_h = height // patch_size
+    grid_w = width // patch_size
+    block_h = grid_h // merge_size
+    block_w = grid_w // merge_size
+    source = images.reshape(
+        batch_size,
+        channel,
+        block_h,
+        merge_size,
+        patch_size,
+        block_w,
+        merge_size,
+        patch_size,
+    ).permute(0, 2, 5, 3, 6, 1, 4, 7)
+
+    fused_mean = (
+        torch.as_tensor(image_mean, dtype=torch.float32, device=images.device)
+        .view(1, 1, 1, 1, 1, channel, 1, 1)
+        .mul_(1.0 / rescale_factor)
+    )
+    fused_std = (
+        torch.as_tensor(image_std, dtype=torch.float32, device=images.device)
+        .view(1, 1, 1, 1, 1, channel, 1, 1)
+        .mul_(1.0 / rescale_factor)
+    )
+    pixel_values = torch.empty(
+        (
+            batch_size,
+            block_h,
+            block_w,
+            merge_size,
+            merge_size,
+            channel,
+            patch_size,
+            patch_size,
+        ),
+        dtype=torch.float32,
+        device=images.device,
+    )
+    torch.sub(source, fused_mean, out=pixel_values)
+    pixel_values.div_(fused_std)
+    return pixel_values.reshape(
+        batch_size * grid_h * grid_w,
+        channel * patch_size * patch_size,
+    )
+
+
 class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]):
     @staticmethod
     def _batch_same_size_rgb_pil_images(images: object) -> object:
@@ -1239,7 +1327,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             return images
 
         width, height = first.size
-        tensors = []
+        arrays = []
         for image in images:
             if (
                 not isinstance(image, PILImage.Image)
@@ -1247,13 +1335,9 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 or image.size != (width, height)
             ):
                 return images
-            tensors.append(
-                torch.frombuffer(image.tobytes(), dtype=torch.uint8)
-                .view(height, width, 3)
-                .permute(2, 0, 1)
-            )
+            arrays.append(np.asarray(image, dtype=np.uint8))
 
-        return torch.stack(tensors, dim=0)
+        return torch.from_numpy(np.stack(arrays, axis=0)).permute(0, 3, 1, 2)
 
     @staticmethod
     def _can_fast_preprocess_batched_images(
@@ -1266,15 +1350,24 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         if images.ndim != 4 or images.dtype != torch.uint8:
             return False
 
+        try:
+            mean_channels = len(image_processor.image_mean)
+            std_channels = len(image_processor.image_std)
+        except TypeError:
+            return False
+        if images.shape[1] != mean_channels or images.shape[1] != std_channels:
+            return False
+        if not image_processor.do_rescale or not image_processor.do_normalize:
+            return False
+
         ignored_kwargs = {"disable_grouping"}
         if any(key not in ignored_kwargs for key in processor_kwargs):
             return False
 
         if not image_processor.do_resize:
             height, width = images.shape[-2:]
-            return height % image_processor.patch_size == 0 and (
-                width % image_processor.patch_size == 0
-            )
+            factor = image_processor.patch_size * image_processor.merge_size
+            return height % factor == 0 and width % factor == 0
 
         return True
 
@@ -1303,15 +1396,22 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     resample=image_processor.resample,
                 )
 
+        batch_size, channel, height, width = images.shape
+        grid_h = height // patch_size
+        grid_w = width // patch_size
         if (
-            image_processor.do_rescale
+            images.dtype == torch.uint8
+            and image_processor.do_rescale
             and image_processor.do_normalize
-            and float(image_processor.rescale_factor) == 1.0 / 255.0
-            and tuple(image_processor.image_mean) == (0.5, 0.5, 0.5)
-            and tuple(image_processor.image_std) == (0.5, 0.5, 0.5)
         ):
-            patches = images.to(dtype=torch.float32)
-            patches.sub_(127.5).div_(127.5)
+            pixel_values = _qwen3_vl_fused_compact_preprocess_uint8_bchw(
+                images,
+                image_processor.image_mean,
+                image_processor.image_std,
+                image_processor.rescale_factor,
+                patch_size,
+                merge_size,
+            )
         else:
             patches = image_processor.rescale_and_normalize(
                 images,
@@ -1321,24 +1421,24 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 image_processor.image_mean,
                 image_processor.image_std,
             )
-        batch_size, channel, height, width = patches.shape
-        grid_h = height // patch_size
-        grid_w = width // patch_size
-        patches = patches.view(
-            batch_size,
-            channel,
-            grid_h // merge_size,
-            merge_size,
-            patch_size,
-            grid_w // merge_size,
-            merge_size,
-            patch_size,
-        )
-        patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7).contiguous()
-        pixel_values = patches.view(
-            batch_size * grid_h * grid_w,
-            channel * patch_size * patch_size,
-        )
+            batch_size, channel, height, width = patches.shape
+            grid_h = height // patch_size
+            grid_w = width // patch_size
+            patches = patches.reshape(
+                batch_size,
+                channel,
+                grid_h // merge_size,
+                merge_size,
+                patch_size,
+                grid_w // merge_size,
+                merge_size,
+                patch_size,
+            )
+            patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7).contiguous()
+            pixel_values = patches.reshape(
+                batch_size * grid_h * grid_w,
+                channel * patch_size * patch_size,
+            )
         image_grid_thw = torch.tensor(
             [[1, grid_h, grid_w]] * batch_size,
             dtype=torch.long,

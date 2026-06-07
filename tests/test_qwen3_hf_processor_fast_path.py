@@ -23,6 +23,7 @@ sys.modules.setdefault("vllm.vllm_flash_attn", module)
 from vllm.model_executor.models.qwen3_vl import (  # noqa: E402
     Qwen3_VisionPatchEmbed,
     Qwen3VLMultiModalProcessor,
+    _qwen3_vl_fused_compact_preprocess_uint8_bchw,
 )
 from vllm.multimodal.parse import MultiModalDataParser  # noqa: E402
 from vllm.multimodal.processing import BaseMultiModalProcessor  # noqa: E402
@@ -138,6 +139,91 @@ def _make_images() -> list[Image.Image]:
         array = np.full((224, 224, 3), index * 40, dtype=np.uint8)
         images.append(Image.fromarray(array, "RGB"))
     return images
+
+
+def _compact_reference_pixel_values(
+    images: torch.Tensor,
+    image_processor: Qwen2VLImageProcessor,
+) -> torch.Tensor:
+    patch_size = image_processor.patch_size
+    merge_size = image_processor.merge_size
+    patches = image_processor.rescale_and_normalize(
+        images,
+        image_processor.do_rescale,
+        image_processor.rescale_factor,
+        image_processor.do_normalize,
+        image_processor.image_mean,
+        image_processor.image_std,
+    )
+    batch_size, channel, height, width = patches.shape
+    grid_h = height // patch_size
+    grid_w = width // patch_size
+    patches = patches.reshape(
+        batch_size,
+        channel,
+        grid_h // merge_size,
+        merge_size,
+        patch_size,
+        grid_w // merge_size,
+        merge_size,
+        patch_size,
+    )
+    patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7).contiguous()
+    return patches.reshape(batch_size * grid_h * grid_w, channel * patch_size**2)
+
+
+def test_qwen3_fused_compact_preprocess_matches_reference() -> None:
+    processor = _make_processor()
+    image_processor = processor.info.get_image_processor()
+    patch_size = image_processor.patch_size
+    merge_size = image_processor.merge_size
+    height = patch_size * merge_size * 2
+    width = patch_size * merge_size * 3
+    images = torch.arange(
+        2 * 3 * height * width,
+        dtype=torch.int64,
+    ).remainder(256).to(torch.uint8)
+    images = images.reshape(2, 3, height, width)
+
+    fused = _qwen3_vl_fused_compact_preprocess_uint8_bchw(
+        images,
+        image_processor.image_mean,
+        image_processor.image_std,
+        image_processor.rescale_factor,
+        patch_size,
+        merge_size,
+    )
+    reference = _compact_reference_pixel_values(images, image_processor)
+
+    torch.testing.assert_close(fused, reference)
+
+
+def test_qwen3_fast_preprocess_requires_merge_aligned_size() -> None:
+    processor = _make_processor()
+    image_processor = processor.info.get_image_processor()
+    image_processor.do_resize = False
+    patch_size = image_processor.patch_size
+    merge_size = image_processor.merge_size
+
+    patch_aligned = torch.zeros(
+        (1, 3, patch_size, patch_size),
+        dtype=torch.uint8,
+    )
+    merge_aligned = torch.zeros(
+        (1, 3, patch_size * merge_size, patch_size * merge_size),
+        dtype=torch.uint8,
+    )
+
+    assert not Qwen3VLMultiModalProcessor._can_fast_preprocess_batched_images(
+        image_processor,
+        patch_aligned,
+        {},
+    )
+    assert Qwen3VLMultiModalProcessor._can_fast_preprocess_batched_images(
+        image_processor,
+        merge_aligned,
+        {},
+    )
 
 
 def test_qwen3_image_only_mm_only_matches_dummy_text_path() -> None:
