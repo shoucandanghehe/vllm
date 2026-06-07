@@ -1360,7 +1360,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         if not image_processor.do_rescale or not image_processor.do_normalize:
             return False
 
-        ignored_kwargs = {"disable_grouping"}
+        ignored_kwargs = {"disable_grouping", "truncation"}
         if any(key not in ignored_kwargs for key in processor_kwargs):
             return False
 

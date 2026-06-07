@@ -224,6 +224,11 @@ def test_qwen3_fast_preprocess_requires_merge_aligned_size() -> None:
         merge_aligned,
         {},
     )
+    assert Qwen3VLMultiModalProcessor._can_fast_preprocess_batched_images(
+        image_processor,
+        merge_aligned,
+        {"truncation": False},
+    )
 
 
 def test_qwen3_image_only_mm_only_matches_dummy_text_path() -> None:
