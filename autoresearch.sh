@@ -22,17 +22,11 @@ fi
 
 PYTHONHASHSEED=0 \
 TOKENIZERS_PARALLELISM=false \
-OMP_NUM_THREADS="${VLLM_HFPROC_OMP_THREADS:-8}" \
-MKL_NUM_THREADS="${VLLM_HFPROC_MKL_THREADS:-8}" \
-OPENBLAS_NUM_THREADS="${VLLM_HFPROC_OPENBLAS_THREADS:-8}" \
-RAYON_NUM_THREADS="${VLLM_HFPROC_RAYON_THREADS:-8}" \
 PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-"$PYTHON" benchmarks/overheads/benchmark_qwen3_hf_processor.py \
-  --requests "${VLLM_HFPROC_REQUESTS:-12}" \
-  --images-per-request "${VLLM_HFPROC_IMAGES_PER_REQUEST:-4}" \
-  --width "${VLLM_HFPROC_IMAGE_WIDTH:-1786}" \
-  --height "${VLLM_HFPROC_IMAGE_HEIGHT:-2526}" \
-  --text-tokens "${VLLM_HFPROC_TEXT_TOKENS:-1024}" \
-  --workers "${VLLM_HFPROC_WORKERS:-4}" \
-  --warmups "${VLLM_HFPROC_WARMUPS:-1}" \
-  --repetitions "${VLLM_HFPROC_REPETITIONS:-2}"
+"$PYTHON" benchmarks/overheads/benchmark_v1_sampler_greedy.py \
+  --batch-size "${VLLM_SAMPLER_BATCH_SIZE:-72}" \
+  --vocab-size "${VLLM_SAMPLER_VOCAB_SIZE:-152064}" \
+  --warmups "${VLLM_SAMPLER_WARMUPS:-20}" \
+  --iterations "${VLLM_SAMPLER_ITERATIONS:-100}" \
+  --repetitions "${VLLM_SAMPLER_REPETITIONS:-5}" \
+  --dtype "${VLLM_SAMPLER_DTYPE:-float16}"
