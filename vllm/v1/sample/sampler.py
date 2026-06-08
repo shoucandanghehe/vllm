@@ -64,6 +64,22 @@ class Sampler(nn.Module):
         self.pin_memory = is_pin_memory_available()
         self.logprobs_mode = logprobs_mode
 
+    @staticmethod
+    def _can_skip_greedy_processing(
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        holder = sampling_metadata.thinking_budget_state_holder
+        return (
+            sampling_metadata.all_greedy
+            and sampling_metadata.max_num_logprobs is None
+            and not sampling_metadata.logprob_token_ids
+            and sampling_metadata.allowed_token_ids_mask is None
+            and not sampling_metadata.bad_words_token_ids
+            and sampling_metadata.no_penalties
+            and not sampling_metadata.logitsprocs.has_active_non_argmax_invariant()
+            and (holder is None or not holder.has_tracked_requests())
+        )
+
     def forward(
         self,
         logits: torch.Tensor,
@@ -72,6 +88,13 @@ class Sampler(nn.Module):
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        if self._can_skip_greedy_processing(sampling_metadata):
+            sampled = self.greedy_sample(logits).to(torch.int32)
+            return SamplerOutput(
+                sampled_token_ids=sampled.unsqueeze(-1),
+                logprobs_tensors=None,
+            )
+
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that

@@ -10,6 +10,7 @@ from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
@@ -164,6 +165,70 @@ def _create_default_sampling_metadata(
         logitsprocs=LogitsProcessors(),
     )
     return fake_sampling_metadata
+
+
+class _ForceTokenZeroProcessor(LogitsProcessor):
+    def __init__(self, active: bool) -> None:
+        self.active = active
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        logits[:, 0] = 1000.0
+        return logits
+
+    def is_argmax_invariant(self) -> bool:
+        return False
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def update_state(self, batch_update) -> None:
+        return None
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_sampler_greedy_fast_path_skips_inactive_processors(device: str):
+    torch.set_default_device(device)
+    logits = torch.zeros((2, VOCAB_SIZE), dtype=torch.float16, device=device)
+    logits[:, 1] = 1.0
+    sampling_metadata = _create_default_sampling_metadata(
+        NUM_OUTPUT_TOKENS, 2, VOCAB_SIZE, torch.device(device)
+    )
+    sampling_metadata.max_num_logprobs = None
+    sampling_metadata.logitsprocs = LogitsProcessors(
+        [_ForceTokenZeroProcessor(active=False)]
+    )
+
+    sampler = Sampler()
+    output = sampler(logits, sampling_metadata)
+
+    assert output.logprobs_tensors is None
+    assert torch.equal(
+        output.sampled_token_ids,
+        torch.full((2, 1), 1, dtype=torch.int32, device=device),
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_sampler_greedy_fast_path_keeps_active_processors(device: str):
+    torch.set_default_device(device)
+    logits = torch.zeros((2, VOCAB_SIZE), dtype=torch.float16, device=device)
+    logits[:, 1] = 1.0
+    sampling_metadata = _create_default_sampling_metadata(
+        NUM_OUTPUT_TOKENS, 2, VOCAB_SIZE, torch.device(device)
+    )
+    sampling_metadata.max_num_logprobs = None
+    sampling_metadata.logitsprocs = LogitsProcessors(
+        [_ForceTokenZeroProcessor(active=True)]
+    )
+
+    sampler = Sampler()
+    output = sampler(logits, sampling_metadata)
+
+    assert output.logprobs_tensors is None
+    assert torch.equal(
+        output.sampled_token_ids,
+        torch.full((2, 1), 0, dtype=torch.int32, device=device),
+    )
 
 
 def _create_weighted_output_token_list(

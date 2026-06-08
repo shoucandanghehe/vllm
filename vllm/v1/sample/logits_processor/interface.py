@@ -91,6 +91,10 @@ class LogitsProcessor(ABC):
         """
         raise NotImplementedError
 
+    def is_active(self) -> bool:
+        """Whether this processor can currently affect logits."""
+        return True
+
     @abstractmethod
     def update_state(
         self,
