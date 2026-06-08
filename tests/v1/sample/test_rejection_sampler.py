@@ -112,6 +112,9 @@ def create_sampling_metadata(
         temperature=temperature,
         all_greedy=all_greedy,
         all_random=not all_greedy,
+        no_temperature=True
+        if all_greedy
+        else bool(torch.all(temperature == 1.0).item()),
         top_p=top_p,
         top_k=top_k,
         generators=generators,

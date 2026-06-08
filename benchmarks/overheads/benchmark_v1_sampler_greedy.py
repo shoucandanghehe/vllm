@@ -20,6 +20,7 @@ def make_metadata(
     batch_size: int,
     vocab_size: int,
     device: torch.device,
+    mode: str,
 ) -> SamplingMetadata:
     logitsprocs = build_logitsprocs(
         vllm_config=VllmConfig(),
@@ -27,12 +28,26 @@ def make_metadata(
         is_pin_memory=is_pin_memory_available(),
         is_pooling_model=False,
     )
+    if mode == "greedy":
+        temperature = torch.zeros((batch_size,), dtype=torch.float32, device=device)
+        all_greedy = True
+        all_random = False
+        top_p = None
+        top_k = None
+    else:
+        temperature = torch.ones((batch_size,), dtype=torch.float32, device=device)
+        all_greedy = False
+        all_random = True
+        top_p = torch.full((batch_size,), 0.95, dtype=torch.float32, device=device)
+        top_k = torch.full((batch_size,), 20, dtype=torch.int32, device=device)
+
     return SamplingMetadata(
-        temperature=torch.zeros((batch_size,), dtype=torch.float32, device=device),
-        all_greedy=True,
-        all_random=False,
-        top_p=None,
-        top_k=None,
+        temperature=temperature,
+        all_greedy=all_greedy,
+        all_random=all_random,
+        no_temperature=True,
+        top_p=top_p,
+        top_k=top_k,
         generators={},
         max_num_logprobs=None,
         no_penalties=True,
@@ -118,6 +133,11 @@ def parse_args() -> argparse.Namespace:
         choices=("float16", "bfloat16", "float32"),
         default="float16",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("greedy", "qwen-default"),
+        default="qwen-default",
+    )
     return parser.parse_args()
 
 
@@ -137,7 +157,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, args.dtype)
     sampler = Sampler().to(device=device)
-    metadata = make_metadata(args.batch_size, args.vocab_size, device)
+    metadata = make_metadata(args.batch_size, args.vocab_size, device, args.mode)
     logits = make_logits(args.batch_size, args.vocab_size, dtype, device)
 
     timer = time_sampler_cuda if device.type == "cuda" else time_sampler_cpu
@@ -151,9 +171,9 @@ def main() -> None:
         for _ in range(args.repetitions)
     ]
     mean_ms = statistics.fmean(times_ms)
-    print(f"METRIC v1_sampler_greedy_mean_ms={mean_ms:.6f}")
-    print(f"METRIC v1_sampler_greedy_p50_ms={percentile(times_ms, 0.50):.6f}")
-    print(f"METRIC v1_sampler_greedy_p95_ms={percentile(times_ms, 0.95):.6f}")
+    print(f"METRIC v1_sampler_mean_ms={mean_ms:.6f}")
+    print(f"METRIC v1_sampler_p50_ms={percentile(times_ms, 0.50):.6f}")
+    print(f"METRIC v1_sampler_p95_ms={percentile(times_ms, 0.95):.6f}")
     print(f"METRIC v1_sampler_batch_size={float(args.batch_size):.6f}")
     print(f"METRIC v1_sampler_vocab_size={float(args.vocab_size):.6f}")
     device_is_cuda = 1.0 if device.type == "cuda" else 0.0

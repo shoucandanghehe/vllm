@@ -147,6 +147,7 @@ def _create_default_sampling_metadata(
         temperature=torch.full((batch_size,), 0.0),
         all_greedy=True,
         all_random=False,
+        no_temperature=True,
         top_p=None,
         top_k=None,
         generators={},

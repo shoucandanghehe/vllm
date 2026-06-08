@@ -5931,6 +5931,7 @@ class GPUModelRunner(
             temperature=dummy_tensors(0.5),
             all_greedy=False,
             all_random=False,
+            no_temperature=False,
             top_p=dummy_tensors(0.9),
             top_k=dummy_tensors(logits.size(1) - 1),
             generators={},

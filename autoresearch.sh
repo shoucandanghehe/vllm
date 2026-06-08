@@ -22,6 +22,7 @@ fi
 
 PYTHONHASHSEED=0 \
 TOKENIZERS_PARALLELISM=false \
+VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}" \
 PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
 "$PYTHON" benchmarks/overheads/benchmark_v1_sampler_greedy.py \
   --batch-size "${VLLM_SAMPLER_BATCH_SIZE:-72}" \
@@ -29,4 +30,5 @@ PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
   --warmups "${VLLM_SAMPLER_WARMUPS:-20}" \
   --iterations "${VLLM_SAMPLER_ITERATIONS:-100}" \
   --repetitions "${VLLM_SAMPLER_REPETITIONS:-5}" \
-  --dtype "${VLLM_SAMPLER_DTYPE:-float16}"
+  --dtype "${VLLM_SAMPLER_DTYPE:-float16}" \
+  --mode "${VLLM_SAMPLER_MODE:-qwen-default}"

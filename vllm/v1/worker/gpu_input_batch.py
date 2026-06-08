@@ -190,6 +190,7 @@ class InputBatch:
         self.temperature_cpu = self.temperature_cpu_tensor.numpy()
         self.greedy_reqs: set[str] = set()
         self.random_reqs: set[str] = set()
+        self.temperature_reqs: set[str] = set()
 
         self.top_p = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
         self.top_p_cpu_tensor = torch.empty(
@@ -385,6 +386,8 @@ class InputBatch:
             else:
                 self.temperature_cpu[req_index] = sampling_params.temperature
                 self.random_reqs.add(req_id)
+                if sampling_params.temperature != 1.0:
+                    self.temperature_reqs.add(req_id)
 
             self.top_p_cpu[req_index] = sampling_params.top_p
             if sampling_params.top_p < 1:
@@ -544,6 +547,7 @@ class InputBatch:
 
         self.greedy_reqs.discard(req_id)
         self.random_reqs.discard(req_id)
+        self.temperature_reqs.discard(req_id)
         self.top_p_reqs.discard(req_id)
         self.top_k_reqs.discard(req_id)
         self.frequency_penalties_reqs.discard(req_id)
@@ -915,6 +919,7 @@ class InputBatch:
             temperature=temperature,
             all_greedy=self.all_greedy,
             all_random=self.all_random,
+            no_temperature=self.no_temperature,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
             top_k=None if self.no_top_k else self.top_k[:num_reqs],
             generators=self.generators,
@@ -1093,6 +1098,10 @@ class InputBatch:
     @property
     def all_random(self) -> bool:
         return len(self.greedy_reqs) == 0
+
+    @property
+    def no_temperature(self) -> bool:
+        return len(self.temperature_reqs) == 0
 
     @property
     def no_top_p(self) -> bool:

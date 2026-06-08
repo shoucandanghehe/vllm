@@ -290,10 +290,11 @@ class Sampler(nn.Module):
 
         assert sampling_metadata.temperature is not None
 
-        # Apply temperature.
-        logits = self.apply_temperature(
-            logits, sampling_metadata.temperature, sampling_metadata.all_random
-        )
+        # Apply temperature if any non-greedy request has a non-default value.
+        if not sampling_metadata.no_temperature:
+            logits = self.apply_temperature(
+                logits, sampling_metadata.temperature, sampling_metadata.all_random
+            )
 
         # Apply logits processors that only apply to random sampling
         # (argmax invariant)

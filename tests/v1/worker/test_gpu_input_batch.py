@@ -144,6 +144,7 @@ def _construct_expected_sampling_metadata(
         temperature=torch.tensor(temperature, dtype=torch.float, device=device),
         all_greedy=False,
         all_random=True,
+        no_temperature=all(x == 1.0 for x in temperature),
         top_p=None
         if all(x == 1.0 for x in top_p)
         else torch.tensor(top_p, dtype=torch.float, device=device),
