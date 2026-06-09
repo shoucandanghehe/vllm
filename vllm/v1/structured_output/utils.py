@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import os
 import tempfile
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -88,6 +89,13 @@ def apply_grammar_bitmask(
         input_batch (InputBatch): The input of model runner.
         logits (torch.Tensor): The output logits of model forward.
     """
+    trace_enabled = bool(os.getenv("VLLM_BACKEND_TRACE_DETAILED"))
+    trace_start = time.monotonic() if trace_enabled else 0.0
+    trace_sort_ms = 0.0
+    trace_h2d_ms = 0.0
+    trace_index_ms = 0.0
+    trace_apply_ms = 0.0
+
     # Serialization of np.ndarray is much more efficient than a tensor,
     # so we receive it in that format.
     raw_grammar_bitmask = grammar_output.grammar_bitmask
@@ -97,6 +105,8 @@ def apply_grammar_bitmask(
     # The order of the requests in the bitmask is not guaranteed to be the
     # same as the order of the requests in the gpu runner's batch. We need
     # to map each compact bitmask row to the corresponding logits row.
+
+    trace_sort_start = time.monotonic() if trace_enabled else 0.0
 
     # Get the batch indices of the structured output requests.
     # Keep track of the number of speculative tokens scheduled for every
@@ -121,6 +131,9 @@ def apply_grammar_bitmask(
                 out_indices.append(logit_idx + i)
                 bitmask_row_indices.append(cumulative_index + i)
         cumulative_index += 1 + num_spec_tokens
+    if trace_enabled:
+        trace_sort_ms = (time.monotonic() - trace_sort_start) * 1000.0
+
 
     if not out_indices:
         return
@@ -136,6 +149,8 @@ def apply_grammar_bitmask(
         # scheduler bitmask. Keep a reusable full-batch GPU bitmask, but only
         # transfer the compact structured rows from CPU. This avoids copying
         # ~batch_size * bitmask_cols int32 values over PCIe every decode step.
+        trace_h2d_start = time.monotonic() if trace_enabled else 0.0
+
         full_bitmask, compact_bitmask = _get_grammar_bitmask_gpu_buffers(
             input_batch,
             logits.shape[0],
@@ -151,20 +166,57 @@ def apply_grammar_bitmask(
                 raw_grammar_bitmask[bitmask_row_indices]
             )
         compact_bitmask.copy_(torch.from_numpy(compact_source), non_blocking=True)
+        if trace_enabled:
+            trace_h2d_ms = (time.monotonic() - trace_h2d_start) * 1000.0
+            trace_index_start = time.monotonic()
+
 
         pin_memory = is_pin_memory_available()
         index_tensor = torch.tensor(
             out_indices, dtype=torch.int32, device="cpu", pin_memory=pin_memory
         ).to(logits.device, non_blocking=True)
         full_bitmask.index_copy_(0, index_tensor.long(), compact_bitmask)
+        if trace_enabled:
+            trace_index_ms = (time.monotonic() - trace_index_start) * 1000.0
+            trace_apply_start = time.monotonic()
 
         xgr.apply_token_bitmask_inplace(
             logits, full_bitmask, indices=None if skip_out_indices else index_tensor
         )
+        if trace_enabled:
+            trace_apply_ms = (time.monotonic() - trace_apply_start) * 1000.0
+            trace_info = getattr(scheduler_output, "trace_info", None) or {}
+            logger.info(
+                "Backend grammar apply trace step=%s wall=%.6f "
+                "device=%s logits_shape=%s logits_dtype=%s raw_mask_shape=%s "
+                "sorted_mask_shape=%s mask_bytes=%d full_mask_bytes=%d "
+                "struct_req_ids=%d out_indices=%d skip_indices=%s "
+                "sort_ms=%.3f h2d_ms=%.3f index_ms=%.3f "
+                "xgrammar_ms=%.3f total_ms=%.3f",
+                trace_info.get("step_id"),
+                time.time(),
+                logits.device,
+                tuple(logits.shape),
+                logits.dtype,
+                tuple(raw_grammar_bitmask.shape),
+                tuple(full_bitmask.shape),
+                compact_source.nbytes,
+                full_bitmask.numel() * full_bitmask.element_size(),
+                len(grammar_output.structured_output_request_ids),
+                len(out_indices),
+                skip_out_indices,
+                trace_sort_ms,
+                trace_h2d_ms,
+                trace_index_ms,
+                trace_apply_ms,
+                (time.monotonic() - trace_start) * 1000.0,
+            )
         return
 
     # CPU case: keep the existing full-batch layout because xgrammar's indexed
     # CPU path also uses original logits row ids to index the bitmask rows.
+    trace_h2d_start = time.monotonic() if trace_enabled else 0.0
+
     sorted_bitmask = np.full(
         shape=(logits.shape[0], raw_grammar_bitmask.shape[1]),
         fill_value=-1,
@@ -174,6 +226,10 @@ def apply_grammar_bitmask(
         sorted_bitmask[logit_idx] = raw_grammar_bitmask[bitmask_row]
 
     grammar_bitmask = torch.from_numpy(sorted_bitmask)
+    if trace_enabled:
+        trace_h2d_ms = (time.monotonic() - trace_h2d_start) * 1000.0
+        trace_apply_start = time.monotonic()
+
     indices = None if skip_out_indices else out_indices
     # Handle dtype conversion for CPU (older xgrammar CPU kernels require float32)
     # See: https://github.com/vllm-project/vllm/issues/31901
@@ -185,6 +241,33 @@ def apply_grammar_bitmask(
         logits.copy_(logits_fp32.to(logits.dtype))
     else:
         xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=indices)
+    if trace_enabled:
+        trace_apply_ms = (time.monotonic() - trace_apply_start) * 1000.0
+        trace_info = getattr(scheduler_output, "trace_info", None) or {}
+        logger.info(
+            "Backend grammar apply trace step=%s wall=%.6f "
+            "device=cpu logits_shape=%s logits_dtype=%s raw_mask_shape=%s "
+            "sorted_mask_shape=%s mask_bytes=%d full_mask_bytes=%d "
+            "struct_req_ids=%d out_indices=%d skip_indices=%s "
+            "sort_ms=%.3f h2d_ms=%.3f index_ms=%.3f "
+            "xgrammar_ms=%.3f total_ms=%.3f",
+            trace_info.get("step_id"),
+            time.time(),
+            tuple(logits.shape),
+            logits.dtype,
+            tuple(raw_grammar_bitmask.shape),
+            tuple(sorted_bitmask.shape),
+            sorted_bitmask.nbytes,
+            sorted_bitmask.nbytes,
+            len(grammar_output.structured_output_request_ids),
+            len(out_indices),
+            skip_out_indices,
+            trace_sort_ms,
+            trace_h2d_ms,
+            trace_index_ms,
+            trace_apply_ms,
+            (time.monotonic() - trace_start) * 1000.0,
+        )
 
 
 class OutlinesVocabulary:
