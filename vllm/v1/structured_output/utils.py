@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from __future__ import annotations
 
 import hashlib
 import importlib.metadata
 import os
 import tempfile
 import time
-from typing import TYPE_CHECKING
 
 import numpy as np
 import regex as re
@@ -16,25 +14,18 @@ from cachetools import LRUCache
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.tokenizers.protocol import TokenizerLike
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
-if TYPE_CHECKING:
-    import outlines_core as oc
-    import transformers.convert_slow_tokenizer as convert_slow_tokenizer
-    import transformers.file_utils as file_utils
-    import xgrammar as xgr
-
-    from vllm.tokenizers import TokenizerLike
-    from vllm.v1.worker.gpu_input_batch import InputBatch
-else:
-    xgr = LazyLoader("xgr", globals(), "xgrammar")
-    oc = LazyLoader("oc", globals(), "outlines_core")
-    file_utils = LazyLoader("file_utils", globals(), "transformers.file_utils")
-    convert_slow_tokenizer = LazyLoader(
-        "convert_slow_tokenizer", globals(), "transformers.convert_slow_tokenizer"
-    )
+xgr = LazyLoader("xgr", globals(), "xgrammar")
+oc = LazyLoader("oc", globals(), "outlines_core")
+file_utils = LazyLoader("file_utils", globals(), "transformers.file_utils")
+convert_slow_tokenizer = LazyLoader(
+    "convert_slow_tokenizer", globals(), "transformers.convert_slow_tokenizer"
+)
 
 
 logger = init_logger(__name__)
