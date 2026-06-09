@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -227,6 +228,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DECODE_TRACE_ENABLED = os.environ.get("VLLM_DECODE_TRACE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -438,6 +447,8 @@ class GPUModelRunner(
         parallel_config = self.parallel_config
         self.device = device
         self.pin_memory = is_pin_memory_available()
+        self._decode_trace_step = 0
+
         self.dtype = self.model_config.dtype
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
@@ -3963,12 +3974,23 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        trace_enabled = _DECODE_TRACE_ENABLED
+        if trace_enabled:
+            trace_step = self._decode_trace_step
+            self._decode_trace_step += 1
+            trace_start = time.perf_counter()
+            trace_ngram_copy_ms = 0.0
+            trace_kv_preemptions_ms = 0.0
+
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
+        if trace_enabled:
+            trace_ngram_copy_start = time.perf_counter()
+
         if (
             self.speculative_config is not None
             and self.speculative_config.use_ngram_gpu()
@@ -3982,19 +4004,39 @@ class GPUModelRunner(
                 num_scheduled_tokens=num_scheduled_tokens_copy,
                 scheduled_spec_decode_tokens=spec_decode_tokens_copy,
             )
+        if trace_enabled:
+            trace_ngram_copy_ms = (
+                time.perf_counter() - trace_ngram_copy_start
+            ) * 1000
+            trace_kv_preemptions_start = time.perf_counter()
+
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+        if trace_enabled:
+            trace_kv_preemptions_ms = (
+                time.perf_counter() - trace_kv_preemptions_start
+            ) * 1000
+
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            if trace_enabled:
+                trace_preprocess_start = time.perf_counter()
+                trace_update_states_start = time.perf_counter()
+
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if trace_enabled:
+                trace_update_states_ms = (
+                    time.perf_counter() - trace_update_states_start
+                ) * 1000
+
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4002,6 +4044,20 @@ class GPUModelRunner(
                     encoder_cache=self.encoder_cache,
                 ) as ec_connector_output:
                     self._execute_mm_encoder(scheduler_output)
+                    if trace_enabled:
+                        logger.info(
+                            "Backend runner preprocess detail trace step=%d "
+                            "early_return=encoder total_ms=%.3f "
+                            "preprocess_total_ms=%.3f update_states_ms=%.3f "
+                            "total_tokens=%d encoder_reqs=%d",
+                            trace_step,
+                            (time.perf_counter() - trace_start) * 1000,
+                            (time.perf_counter() - trace_preprocess_start) * 1000,
+                            trace_update_states_ms,
+                            num_scheduled_tokens,
+                            len(scheduler_output.scheduled_encoder_inputs),
+                        )
+
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
             if not num_scheduled_tokens:
@@ -4029,17 +4085,32 @@ class GPUModelRunner(
                     "it when the requests need prompt logprobs"
                 )
 
+            if trace_enabled:
+                trace_tokens_array_start = time.perf_counter()
+
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            if trace_enabled:
+                trace_tokens_array_ms = (
+                    time.perf_counter() - trace_tokens_array_start
+                ) * 1000
+                trace_prepare_inputs_start = time.perf_counter()
+
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if trace_enabled:
+                trace_prepare_inputs_ms = (
+                    time.perf_counter() - trace_prepare_inputs_start
+                ) * 1000
+                trace_cascade_start = time.perf_counter()
+
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4050,6 +4121,10 @@ class GPUModelRunner(
                     self.input_batch.num_computed_tokens_cpu[:num_reqs],
                     scheduler_output.num_common_prefix_blocks,
                 )
+            if trace_enabled:
+                trace_cascade_ms = (time.perf_counter() - trace_cascade_start) * 1000
+                trace_dispatch_start = time.perf_counter()
+
 
             (
                 cudagraph_mode,
@@ -4065,6 +4140,12 @@ class GPUModelRunner(
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+            if trace_enabled:
+                trace_dispatch_ms = (
+                    time.perf_counter() - trace_dispatch_start
+                ) * 1000
+                trace_ubatch_start = time.perf_counter()
+
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4086,6 +4167,10 @@ class GPUModelRunner(
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
             )
+            if trace_enabled:
+                trace_ubatch_ms = (time.perf_counter() - trace_ubatch_start) * 1000
+                trace_exec_config_start = time.perf_counter()
+
 
             logger.debug(
                 "ubatch_slices: %s, ubatch_slices_padded: %s",
@@ -4105,6 +4190,12 @@ class GPUModelRunner(
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
             )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+            if trace_enabled:
+                trace_exec_config_ms = (
+                    time.perf_counter() - trace_exec_config_start
+                ) * 1000
+                trace_mamba_start = time.perf_counter()
+
 
             if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
@@ -4149,6 +4240,10 @@ class GPUModelRunner(
                         self.mamba_state_idx,
                     )
 
+            if trace_enabled:
+                trace_mamba_ms = (time.perf_counter() - trace_mamba_start) * 1000
+                trace_slot_mapping_start = time.perf_counter()
+
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
@@ -4162,6 +4257,12 @@ class GPUModelRunner(
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
+            if trace_enabled:
+                trace_slot_mapping_ms = (
+                    time.perf_counter() - trace_slot_mapping_start
+                ) * 1000
+                trace_attn_metadata_start = time.perf_counter()
+
 
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -4178,6 +4279,12 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            if trace_enabled:
+                trace_attn_metadata_ms = (
+                    time.perf_counter() - trace_attn_metadata_start
+                ) * 1000
+                trace_runner_preprocess_start = time.perf_counter()
+
 
             (
                 input_ids,
@@ -4189,6 +4296,14 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            if trace_enabled:
+                trace_runner_preprocess_ms = (
+                    time.perf_counter() - trace_runner_preprocess_start
+                ) * 1000
+                trace_preprocess_total_ms = (
+                    time.perf_counter() - trace_preprocess_start
+                ) * 1000
+
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4210,6 +4325,9 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        if trace_enabled:
+            trace_forward_start = time.perf_counter()
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -4235,6 +4353,12 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if trace_enabled:
+            trace_forward_ms = (time.perf_counter() - trace_forward_start) * 1000
+            trace_postprocess_start = time.perf_counter()
+            trace_hidden_gather_ms = 0.0
+            trace_compute_logits_ms = 0.0
+
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4263,13 +4387,35 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                if trace_enabled:
+                    trace_hidden_gather_start = time.perf_counter()
+
                 sample_hidden_states = hidden_states[logits_indices]
+                if trace_enabled:
+                    trace_hidden_gather_ms = (
+                        time.perf_counter() - trace_hidden_gather_start
+                    ) * 1000
+                    trace_compute_logits_start = time.perf_counter()
+
                 logits = self.model.compute_logits(sample_hidden_states)
+                if trace_enabled:
+                    trace_compute_logits_ms = (
+                        time.perf_counter() - trace_compute_logits_start
+                    ) * 1000
+
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
+                if trace_enabled:
+                    trace_hidden_gather_start = time.perf_counter()
+
                 sample_hidden_states = hidden_states[logits_indices]
+                if trace_enabled:
+                    trace_hidden_gather_ms = (
+                        time.perf_counter() - trace_hidden_gather_start
+                    ) * 1000
+
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
@@ -4283,7 +4429,15 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    if trace_enabled:
+                        trace_compute_logits_start = time.perf_counter()
+
                     logits = self.model.compute_logits(sample_hidden_states)
+                    if trace_enabled:
+                        trace_compute_logits_ms = (
+                            time.perf_counter() - trace_compute_logits_start
+                        ) * 1000
+
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -4294,6 +4448,68 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        if trace_enabled:
+            trace_postprocess_ms = (
+                time.perf_counter() - trace_postprocess_start
+            ) * 1000
+            all_one_token = bool((num_scheduled_tokens_np == 1).all())
+            logger.info(
+                "Backend runner preprocess detail trace step=%d total_ms=%.3f "
+                "ngram_copy_ms=%.3f kv_preemptions_ms=%.3f "
+                "preprocess_total_ms=%.3f update_states_ms=%.3f "
+                "tokens_array_ms=%.3f prepare_inputs_ms=%.3f "
+                "cascade_ms=%.3f dispatch_ms=%.3f ubatch_ms=%.3f "
+                "exec_config_ms=%.3f mamba_ms=%.3f slot_mapping_ms=%.3f "
+                "attn_metadata_ms=%.3f runner_preprocess_ms=%.3f "
+                "forward_ms=%.3f postprocess_ms=%.3f hidden_gather_ms=%.3f "
+                "compute_logits_ms=%.3f input_reqs=%d reqs_padded=%d "
+                "tokens_unpadded=%d tokens_padded=%d max_scheduled_tokens=%d "
+                "min_scheduled_tokens=%d all_one_token=%s encoder_reqs=%d "
+                "use_spec_decode=%s has_encoder_input=%s cascade=%s "
+                "pad_attn=%s has_separate_kv_update=%s should_ubatch=%s "
+                "cudagraph_mode=%s batch_tokens=%d batch_reqs=%s "
+                "logits_rows=%d prev_sampled=%s",
+                trace_step,
+                (time.perf_counter() - trace_start) * 1000,
+                trace_ngram_copy_ms,
+                trace_kv_preemptions_ms,
+                trace_preprocess_total_ms,
+                trace_update_states_ms,
+                trace_tokens_array_ms,
+                trace_prepare_inputs_ms,
+                trace_cascade_ms,
+                trace_dispatch_ms,
+                trace_ubatch_ms,
+                trace_exec_config_ms,
+                trace_mamba_ms,
+                trace_slot_mapping_ms,
+                trace_attn_metadata_ms,
+                trace_runner_preprocess_ms,
+                trace_forward_ms,
+                trace_postprocess_ms,
+                trace_hidden_gather_ms,
+                trace_compute_logits_ms,
+                num_reqs,
+                num_reqs_padded,
+                num_tokens_unpadded,
+                num_tokens_padded,
+                max_num_scheduled_tokens,
+                int(num_scheduled_tokens_np.min()),
+                all_one_token,
+                num_encoder_reqs,
+                use_spec_decode,
+                has_encoder_input,
+                cascade_attn_prefix_lens is not None,
+                pad_attn,
+                has_separate_kv_update,
+                should_ubatch,
+                cudagraph_mode,
+                batch_desc.num_tokens,
+                batch_desc.num_reqs,
+                logits_indices.shape[0],
+                self.input_batch.prev_sampled_token_ids is not None,
+            )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,

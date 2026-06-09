@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -60,6 +61,14 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+_DECODE_TRACE_ENABLED = os.environ.get("VLLM_DECODE_TRACE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -98,6 +107,7 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        self._decode_trace_step = 0
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -338,6 +348,15 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        trace_enabled = _DECODE_TRACE_ENABLED
+        if trace_enabled:
+            trace_step = self._decode_trace_step
+            self._decode_trace_step += 1
+            trace_start = time.perf_counter()
+            trace_running_before = len(self.running)
+            trace_waiting_before = len(self.waiting)
+            trace_skipped_waiting_before = len(self.skipped_waiting)
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -359,7 +378,14 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        if trace_enabled:
+            trace_new_step_start = time.perf_counter()
+
         self.kv_cache_manager.new_step_starts()
+        if trace_enabled:
+            trace_new_step_ms = (time.perf_counter() - trace_new_step_start) * 1000
+            trace_running_loop_start = time.perf_counter()
+
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -531,6 +557,12 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+        if trace_enabled:
+            trace_running_loop_ms = (
+                time.perf_counter() - trace_running_loop_start
+            ) * 1000
+            trace_lora_start = time.perf_counter()
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -540,6 +572,10 @@ class Scheduler(SchedulerInterface):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+        if trace_enabled:
+            trace_lora_ms = (time.perf_counter() - trace_lora_start) * 1000
+            trace_waiting_loop_start = time.perf_counter()
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -822,6 +858,11 @@ class Scheduler(SchedulerInterface):
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
+        if trace_enabled:
+            trace_waiting_loop_ms = (
+                time.perf_counter() - trace_waiting_loop_start
+            ) * 1000
+
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
@@ -838,12 +879,20 @@ class Scheduler(SchedulerInterface):
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
+        if trace_enabled:
+            trace_common_prefix_start = time.perf_counter()
+
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
             if self.running:
                 any_request_id = self.running[0].request_id
                 num_common_prefix_blocks = (
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
                 )
+        if trace_enabled:
+            trace_common_prefix_ms = (
+                time.perf_counter() - trace_common_prefix_start
+            ) * 1000
+
 
         # Construct the scheduler output.
         if self.use_v2_model_runner:
@@ -865,6 +914,9 @@ class Scheduler(SchedulerInterface):
                 for req in scheduled_new_reqs
             ]
 
+        if trace_enabled:
+            trace_make_cached_start = time.perf_counter()
+
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
@@ -873,6 +925,11 @@ class Scheduler(SchedulerInterface):
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
             )
+        if trace_enabled:
+            trace_make_cached_ms = (
+                time.perf_counter() - trace_make_cached_start
+            ) * 1000
+
 
         # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
@@ -906,9 +963,18 @@ class Scheduler(SchedulerInterface):
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
+        if trace_enabled:
+            trace_kv_connector_start = time.perf_counter()
+
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+
+        if trace_enabled:
+            trace_kv_connector_ms = (
+                time.perf_counter() - trace_kv_connector_start
+            ) * 1000
+            trace_ec_connector_start = time.perf_counter()
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -917,8 +983,72 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        if trace_enabled:
+            trace_ec_connector_ms = (
+                time.perf_counter() - trace_ec_connector_start
+            ) * 1000
+            trace_update_after_start = time.perf_counter()
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if trace_enabled:
+            trace_update_after_ms = (
+                time.perf_counter() - trace_update_after_start
+            ) * 1000
+            scheduled_reqs = len(num_scheduled_tokens)
+            all_one_token = all(n == 1 for n in num_scheduled_tokens.values())
+            decode_only = (
+                scheduled_reqs > 0
+                and total_num_scheduled_tokens == scheduled_reqs
+                and not scheduled_new_reqs
+                and not scheduled_resumed_reqs
+                and not scheduled_encoder_inputs
+                and not scheduled_spec_decode_tokens
+            )
+            logger.info(
+                "Backend scheduler detail trace step=%d total_ms=%.3f "
+                "new_step_ms=%.3f running_loop_ms=%.3f lora_ms=%.3f "
+                "waiting_loop_ms=%.3f common_prefix_ms=%.3f "
+                "make_cached_ms=%.3f kv_connector_ms=%.3f "
+                "ec_connector_ms=%.3f update_after_ms=%.3f "
+                "running_before=%d running_after=%d waiting_before=%d "
+                "waiting_after=%d skipped_waiting_before=%d "
+                "skipped_waiting_after=%d scheduled_running=%d "
+                "scheduled_new=%d scheduled_resumed=%d preempted=%d "
+                "scheduled_reqs=%d total_tokens=%d all_one_token=%s "
+                "decode_only=%s token_budget_left=%d encoder_reqs=%d "
+                "encoder_items=%d spec_reqs=%d structured_output=%s",
+                trace_step,
+                (time.perf_counter() - trace_start) * 1000,
+                trace_new_step_ms,
+                trace_running_loop_ms,
+                trace_lora_ms,
+                trace_waiting_loop_ms,
+                trace_common_prefix_ms,
+                trace_make_cached_ms,
+                trace_kv_connector_ms,
+                trace_ec_connector_ms,
+                trace_update_after_ms,
+                trace_running_before,
+                len(self.running),
+                trace_waiting_before,
+                len(self.waiting),
+                trace_skipped_waiting_before,
+                len(self.skipped_waiting),
+                len(scheduled_running_reqs),
+                len(scheduled_new_reqs),
+                len(scheduled_resumed_reqs),
+                len(preempted_reqs),
+                scheduled_reqs,
+                total_num_scheduled_tokens,
+                all_one_token,
+                decode_only,
+                token_budget,
+                len(scheduled_encoder_inputs),
+                sum(len(v) for v in scheduled_encoder_inputs.values()),
+                len(scheduled_spec_decode_tokens),
+                scheduler_output.has_structured_output_requests,
+            )
         return scheduler_output
 
     def _build_kv_connector_meta(
