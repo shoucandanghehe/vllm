@@ -1543,7 +1543,9 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
+            if new_token_ids and self.structured_output_manager.should_advance(
+                request, new_token_ids
+            ):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
@@ -1835,7 +1837,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            if self.structured_output_manager.should_advance(request):
+            if self.structured_output_manager.should_advance(request, spec_token_ids):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
@@ -1864,7 +1866,7 @@ class Scheduler(SchedulerInterface):
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
             # Filter out spec tokens which do not adhere to the grammar.
-            if self.structured_output_manager.should_advance(request):
+            if self.structured_output_manager.should_advance(request, spec_token_ids):
                 metadata = request.structured_output_request
                 assert metadata is not None and metadata.grammar is not None
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)

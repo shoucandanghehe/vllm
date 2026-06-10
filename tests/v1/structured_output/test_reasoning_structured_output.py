@@ -189,6 +189,28 @@ class TestReasoningStructuredOutput:
         # Should return False since reasoning hasn't ended
         assert result is False
 
+    def test_should_advance_uses_delta_token_ids(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        """Decode callers pass accepted tokens directly to avoid rebuilding
+        per-request token slices on every step."""
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_ended = False
+        reasoner = MockReasoner(tokenizer=Mock())
+        structured_req.reasoner = reasoner
+
+        delta_token_ids = [42]
+        result = manager_with_reasoner.should_advance(
+            mock_request_with_structured_output, delta_token_ids
+        )
+
+        assert result is False
+        reasoner.is_reasoning_end_streaming.assert_called_once_with(
+            mock_request_with_structured_output.all_token_ids, delta_token_ids
+        )
+
     def test_should_advance_reasoning_just_ended(
         self,
         manager_with_reasoner,
