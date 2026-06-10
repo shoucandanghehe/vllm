@@ -88,11 +88,24 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
-        if super().is_reasoning_end_streaming(input_ids, delta_ids):
+        # The structured-output decode hot path passes the accepted token ids
+        # directly.  Avoid the parent implementation here: it performs one
+        # membership scan for </think>, and a generic iterable would be
+        # exhausted before the <tool_call> implicit-end check below.
+        if not isinstance(delta_ids, Sequence):
+            delta_ids = tuple(delta_ids)
+
+        end_token_id = self.end_token_id
+        tool_call_token_id = self._tool_call_token_id
+        if len(delta_ids) == 1:
+            token_id = delta_ids[0]
+            return token_id == end_token_id or (
+                tool_call_token_id is not None and token_id == tool_call_token_id
+            )
+
+        if end_token_id in delta_ids:
             return True
-        if self._tool_call_token_id is not None:
-            return self._tool_call_token_id in delta_ids
-        return False
+        return tool_call_token_id is not None and tool_call_token_id in delta_ids
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         """

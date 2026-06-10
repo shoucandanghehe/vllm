@@ -11,6 +11,18 @@ from tests.reasoning.utils import (
 )
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
+from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
+
+
+class FakeQwen3Tokenizer:
+    def get_vocab(self):
+        return {
+            "<think>": 1,
+            "</think>": 2,
+            "<tool_call>": 3,
+            "</tool_call>": 4,
+        }
+
 
 parser_name = "qwen3"
 start_token = "<think>"
@@ -240,6 +252,20 @@ TEST_CASES = [
     ),
 ]
 
+
+
+def test_qwen3_reasoning_end_streaming_handles_iterable_tool_call():
+    parser = Qwen3ReasoningParser(FakeQwen3Tokenizer())
+
+    assert parser.is_reasoning_end_streaming([], iter([3])) is True
+
+
+def test_qwen3_reasoning_end_streaming_single_token_fast_path():
+    parser = Qwen3ReasoningParser(FakeQwen3Tokenizer())
+
+    assert parser.is_reasoning_end_streaming([], [2]) is True
+    assert parser.is_reasoning_end_streaming([], [3]) is True
+    assert parser.is_reasoning_end_streaming([], [5]) is False
 
 @pytest.mark.parametrize("streaming, param_dict", TEST_CASES)
 def test_reasoning(
