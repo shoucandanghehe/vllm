@@ -20,7 +20,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
@@ -237,6 +237,15 @@ def test_kv_cache_block_uses_slots():
     # Verify that slots actually prevent dynamic attribute assignment.
     with pytest.raises(AttributeError):
         block.unexpected_field = True
+
+def test_kv_cache_blocks_is_empty_matches_allow_none_semantics():
+    empty = KVCacheBlocks(((), []))
+    assert empty.is_empty()
+    assert empty.get_block_ids(allow_none=True) is None
+
+    non_empty = KVCacheBlocks(([KVCacheBlock(block_id=1)], []))
+    assert not non_empty.is_empty()
+    assert non_empty.get_block_ids(allow_none=True) == ([1], [])
 
 
 def test_free_kv_cache_block_queue_initialization():

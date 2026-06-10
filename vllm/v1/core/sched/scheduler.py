@@ -336,6 +336,21 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _needs_mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_external_computed_tokens: int = 0,
+    ) -> bool:
+        if not self.need_mamba_block_aligned_split:
+            return False
+        assert num_external_computed_tokens == 0, (
+            "External KV connector is not verified yet"
+        )
+        return num_computed_tokens < max(
+            request.num_prompt_tokens, request.num_tokens - 1
+        )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -441,7 +456,9 @@ class Scheduler(SchedulerInterface):
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
 
-            if self.need_mamba_block_aligned_split:
+            if self._needs_mamba_block_aligned_split(
+                request, request.num_computed_tokens
+            ):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
@@ -578,7 +595,12 @@ class Scheduler(SchedulerInterface):
             trace_waiting_loop_start = time.perf_counter()
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and token_budget > 0
+            and (self.waiting or self.skipped_waiting)
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -723,7 +745,11 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                if self._needs_mamba_block_aligned_split(
+                    request,
+                    num_computed_tokens,
+                    num_external_computed_tokens,
+                ):
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
@@ -1205,8 +1231,9 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
+            new_blocks = req_to_new_blocks[req_id]
             new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                None if new_blocks.is_empty() else new_blocks.get_block_ids()
             )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(

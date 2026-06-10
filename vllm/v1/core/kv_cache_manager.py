@@ -83,6 +83,9 @@ class KVCacheBlocks:
             return None
         return tuple([blk.block_id for blk in group] for group in self.blocks)
 
+    def is_empty(self) -> bool:
+        return all(not group for group in self.blocks)
+
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
         assert len(self.blocks) == 1, "Only one group is supported"

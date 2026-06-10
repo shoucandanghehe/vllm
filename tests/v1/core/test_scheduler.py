@@ -3878,6 +3878,53 @@ def test_fcfs_mixed_skipped_waiting_types_keep_order():
     assert [req.request_id for req in scheduler.running] == expected_order
     scheduler._update_waiting_for_remote_kv.assert_called_once_with(req_remote)
 
+def test_waiting_queue_guard_preserves_empty_and_non_empty_behavior():
+    empty_scheduler = create_scheduler()
+    empty_scheduler._select_waiting_queue_for_scheduling = Mock(
+        wraps=empty_scheduler._select_waiting_queue_for_scheduling
+    )
+
+    empty_output = empty_scheduler.schedule()
+
+    empty_scheduler._select_waiting_queue_for_scheduling.assert_not_called()
+    assert not empty_output.scheduled_new_reqs
+
+    non_empty_scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=4)
+    request = create_requests(num_requests=1, num_tokens=1)[0]
+    non_empty_scheduler.add_request(request)
+    non_empty_scheduler._select_waiting_queue_for_scheduling = Mock(
+        wraps=non_empty_scheduler._select_waiting_queue_for_scheduling
+    )
+
+    non_empty_output = non_empty_scheduler.schedule()
+
+    non_empty_scheduler._select_waiting_queue_for_scheduling.assert_called_once()
+    assert [req.req_id for req in non_empty_output.scheduled_new_reqs] == [
+        request.request_id
+    ]
+
+
+def test_mamba_split_guard_matches_original_no_op_predicate():
+    scheduler = object.__new__(Scheduler)
+    scheduler.cache_config = Mock(block_size=16)
+    scheduler.use_eagle = False
+
+    request = Mock()
+    request.num_computed_tokens = 9
+    request.num_prompt_tokens = 4
+    request.num_tokens = 10
+
+    scheduler.need_mamba_block_aligned_split = False
+    assert not scheduler._needs_mamba_block_aligned_split(
+        request, request.num_computed_tokens
+    )
+
+    scheduler.need_mamba_block_aligned_split = True
+    assert not scheduler._needs_mamba_block_aligned_split(
+        request, request.num_computed_tokens
+    )
+    assert scheduler._mamba_block_aligned_split(request, 3) == 3
+
 
 def test_abort_request_waiting_for_remote_kvs():
     scheduler = create_scheduler(use_kv_connector=True)
