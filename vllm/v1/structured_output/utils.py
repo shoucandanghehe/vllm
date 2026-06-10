@@ -66,6 +66,33 @@ def _get_grammar_bitmask_gpu_buffers(
     return full_bitmask[:num_logits_rows], compact_bitmask[:num_bitmask_rows]
 
 
+def _get_grammar_bitmask_cpu_buffer(
+    input_batch: InputBatch,
+    num_bitmask_rows: int,
+    bitmask_cols: int,
+) -> torch.Tensor | None:
+    """Return a reusable pinned CPU staging buffer when the platform supports it."""
+    if not is_pin_memory_available():
+        return None
+
+    cache = getattr(input_batch, "_grammar_bitmask_cpu_buffer", None)
+    if (
+        cache is not None
+        and cache.shape[0] >= num_bitmask_rows
+        and cache.shape[1] == bitmask_cols
+    ):
+        return cache[:num_bitmask_rows]
+
+    rows = max(num_bitmask_rows, 1)
+    cache = torch.empty((rows, bitmask_cols), dtype=torch.int32, pin_memory=True)
+    input_batch._grammar_bitmask_cpu_buffer = cache
+    return cache[:num_bitmask_rows]
+
+
+def _is_identity_range(values: list[int]) -> bool:
+    return all(index == value for index, value in enumerate(values))
+
+
 def apply_grammar_bitmask(
     scheduler_output: SchedulerOutput,
     grammar_output: GrammarOutput,
@@ -129,17 +156,18 @@ def apply_grammar_bitmask(
     if not out_indices:
         return
 
-    # If the length of out indices and the logits have the same shape
-    # we don't need to pass indices to the kernel,
-    # since the bitmask is already aligned with the logits.
-    skip_out_indices = len(out_indices) == logits.shape[0]
+    # If every logits row has a structured-output bitmask and both producers
+    # already agree on row order, xgrammar can consume the compact GPU buffer
+    # directly.  Otherwise keep the full-batch buffer because xgrammar's CUDA
+    # indexed path uses original logits row ids to index bitmask rows.
+    all_logits_structured = len(out_indices) == logits.shape[0]
+    bitmask_rows_are_aligned = (
+        all_logits_structured
+        and _is_identity_range(out_indices)
+        and _is_identity_range(bitmask_row_indices)
+    )
 
     if not logits.is_cpu:
-        # xgrammar's indexed CUDA kernel uses the original logits row as the
-        # bitmask row as well. Therefore it cannot directly consume the compact
-        # scheduler bitmask. Keep a reusable full-batch GPU bitmask, but only
-        # transfer the compact structured rows from CPU. This avoids copying
-        # ~batch_size * bitmask_cols int32 values over PCIe every decode step.
         trace_h2d_start = time.monotonic() if trace_enabled else 0.0
 
         full_bitmask, compact_bitmask = _get_grammar_bitmask_gpu_buffers(
@@ -149,30 +177,46 @@ def apply_grammar_bitmask(
             raw_grammar_bitmask.shape[1],
             logits.device,
         )
-        full_bitmask.fill_(-1)
-        if bitmask_row_indices == list(range(len(bitmask_row_indices))):
+        if _is_identity_range(bitmask_row_indices):
             compact_source = raw_grammar_bitmask[: len(bitmask_row_indices)]
         else:
             compact_source = np.ascontiguousarray(
                 raw_grammar_bitmask[bitmask_row_indices]
             )
-        compact_bitmask.copy_(torch.from_numpy(compact_source), non_blocking=True)
+
+        compact_source_tensor = torch.from_numpy(compact_source)
+        pinned_bitmask = _get_grammar_bitmask_cpu_buffer(
+            input_batch, len(out_indices), raw_grammar_bitmask.shape[1]
+        )
+        h2d_source = compact_source_tensor
+        if pinned_bitmask is not None:
+            pinned_bitmask.copy_(compact_source_tensor)
+            h2d_source = pinned_bitmask
+
+        if not bitmask_rows_are_aligned:
+            full_bitmask.fill_(-1)
+        compact_bitmask.copy_(h2d_source, non_blocking=pinned_bitmask is not None)
         if trace_enabled:
             trace_h2d_ms = (time.monotonic() - trace_h2d_start) * 1000.0
             trace_index_start = time.monotonic()
 
-
-        pin_memory = is_pin_memory_available()
-        index_tensor = torch.tensor(
-            out_indices, dtype=torch.int32, device="cpu", pin_memory=pin_memory
-        ).to(logits.device, non_blocking=True)
-        full_bitmask.index_copy_(0, index_tensor.long(), compact_bitmask)
+        index_tensor = None
+        applied_bitmask = compact_bitmask
+        if not bitmask_rows_are_aligned:
+            pin_memory = is_pin_memory_available()
+            index_tensor = torch.tensor(
+                out_indices, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            ).to(logits.device, non_blocking=True)
+            full_bitmask.index_copy_(0, index_tensor.long(), compact_bitmask)
+            applied_bitmask = full_bitmask
         if trace_enabled:
             trace_index_ms = (time.monotonic() - trace_index_start) * 1000.0
             trace_apply_start = time.monotonic()
 
         xgr.apply_token_bitmask_inplace(
-            logits, full_bitmask, indices=None if skip_out_indices else index_tensor
+            logits,
+            applied_bitmask,
+            indices=None if all_logits_structured else index_tensor,
         )
         if trace_enabled:
             trace_apply_ms = (time.monotonic() - trace_apply_start) * 1000.0
@@ -190,12 +234,12 @@ def apply_grammar_bitmask(
                 tuple(logits.shape),
                 logits.dtype,
                 tuple(raw_grammar_bitmask.shape),
-                tuple(full_bitmask.shape),
+                tuple(applied_bitmask.shape),
                 compact_source.nbytes,
-                full_bitmask.numel() * full_bitmask.element_size(),
+                applied_bitmask.numel() * applied_bitmask.element_size(),
                 len(grammar_output.structured_output_request_ids),
                 len(out_indices),
-                skip_out_indices,
+                all_logits_structured,
                 trace_sort_ms,
                 trace_h2d_ms,
                 trace_index_ms,
@@ -221,7 +265,7 @@ def apply_grammar_bitmask(
         trace_h2d_ms = (time.monotonic() - trace_h2d_start) * 1000.0
         trace_apply_start = time.monotonic()
 
-    indices = None if skip_out_indices else out_indices
+    indices = None if all_logits_structured else out_indices
     # Handle dtype conversion for CPU (older xgrammar CPU kernels require float32)
     # See: https://github.com/vllm-project/vllm/issues/31901
     if logits.dtype != torch.float32:
@@ -252,7 +296,7 @@ def apply_grammar_bitmask(
             sorted_bitmask.nbytes,
             len(grammar_output.structured_output_request_ids),
             len(out_indices),
-            skip_out_indices,
+            all_logits_structured,
             trace_sort_ms,
             trace_h2d_ms,
             trace_index_ms,

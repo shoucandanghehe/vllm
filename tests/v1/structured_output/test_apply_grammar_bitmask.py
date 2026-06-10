@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.v1.structured_output import utils as structured_output_utils
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 
 
@@ -115,3 +116,97 @@ def test_apply_grammar_bitmask_reuses_gpu_buffers() -> None:
 
     assert first_full.data_ptr() == second_full.data_ptr()
     assert first_compact.data_ptr() == second_compact.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_apply_grammar_bitmask_uses_compact_buffer_for_aligned_full_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vocab_size = 64
+    raw_bitmask = _make_bitmask(2, vocab_size)
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={})
+    grammar_output = SimpleNamespace(
+        grammar_bitmask=raw_bitmask,
+        structured_output_request_ids=["first", "second"],
+    )
+    input_batch = SimpleNamespace(req_ids=["first", "second"])
+    captured: dict[str, Any] = {}
+
+    def fake_apply_token_bitmask_inplace(
+        logits: torch.Tensor,
+        bitmask: torch.Tensor,
+        indices: torch.Tensor | None = None,
+    ) -> None:
+        captured["indices"] = indices
+        captured["bitmask_ptr"] = bitmask.data_ptr()
+        captured["bitmask"] = bitmask.cpu().numpy().copy()
+
+    monkeypatch.setattr(
+        structured_output_utils,
+        "xgr",
+        SimpleNamespace(apply_token_bitmask_inplace=fake_apply_token_bitmask_inplace),
+    )
+
+    logits = torch.zeros((2, vocab_size), dtype=torch.float32, device="cuda")
+    apply_grammar_bitmask(
+        cast(Any, scheduler_output),
+        cast(Any, grammar_output),
+        cast(Any, input_batch),
+        logits,
+    )
+    full_bitmask, compact_bitmask = cast(
+        tuple[torch.Tensor, torch.Tensor],
+        input_batch._grammar_bitmask_gpu_buffers,
+    )
+
+    assert captured["indices"] is None
+    assert captured["bitmask_ptr"] == compact_bitmask.data_ptr()
+    assert captured["bitmask_ptr"] != full_bitmask.data_ptr()
+    np.testing.assert_array_equal(captured["bitmask"], raw_bitmask)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_apply_grammar_bitmask_reorders_permuted_full_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vocab_size = 64
+    raw_bitmask = _make_bitmask(2, vocab_size)
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={})
+    grammar_output = SimpleNamespace(
+        grammar_bitmask=raw_bitmask,
+        structured_output_request_ids=["first", "second"],
+    )
+    input_batch = SimpleNamespace(req_ids=["second", "first"])
+    captured: dict[str, Any] = {}
+
+    def fake_apply_token_bitmask_inplace(
+        logits: torch.Tensor,
+        bitmask: torch.Tensor,
+        indices: torch.Tensor | None = None,
+    ) -> None:
+        captured["indices"] = indices
+        captured["bitmask_ptr"] = bitmask.data_ptr()
+        captured["bitmask"] = bitmask.cpu().numpy().copy()
+
+    monkeypatch.setattr(
+        structured_output_utils,
+        "xgr",
+        SimpleNamespace(apply_token_bitmask_inplace=fake_apply_token_bitmask_inplace),
+    )
+
+    logits = torch.zeros((2, vocab_size), dtype=torch.float32, device="cuda")
+    apply_grammar_bitmask(
+        cast(Any, scheduler_output),
+        cast(Any, grammar_output),
+        cast(Any, input_batch),
+        logits,
+    )
+    full_bitmask, compact_bitmask = cast(
+        tuple[torch.Tensor, torch.Tensor],
+        input_batch._grammar_bitmask_gpu_buffers,
+    )
+
+    assert captured["indices"] is None
+    assert captured["bitmask_ptr"] == full_bitmask.data_ptr()
+    assert captured["bitmask_ptr"] != compact_bitmask.data_ptr()
+    np.testing.assert_array_equal(captured["bitmask"], raw_bitmask[[1, 0]])
