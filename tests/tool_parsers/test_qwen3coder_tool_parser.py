@@ -1381,6 +1381,48 @@ def test_streaming_multi_param_single_chunk(qwen3_tool_parser, qwen3_tokenizer):
     assert args["unit"] == "fahrenheit"
 
 
+def test_streaming_final_param_and_function_close_single_chunk(qwen3_tokenizer):
+    """Regression: stream_interval may deliver final param and close together."""
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "read_pdf",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"page": {"type": "integer"}},
+                },
+            },
+        )
+    ]
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+
+    deltas = [
+        "\n\n<tool_call>",
+        "\n<function=read_pdf>\n<",
+        "parameter=page>\n1\n</",
+        "parameter>\n</function>\n</tool_call>",
+        "",
+    ]
+
+    from tests.tool_parsers.utils import (
+        run_tool_extraction_streaming,
+    )
+
+    reconstructor = run_tool_extraction_streaming(
+        parser,
+        deltas,
+        request,
+        assert_one_tool_per_delta=False,
+    )
+
+    assert len(reconstructor.tool_calls) == 1
+    tool_call = reconstructor.tool_calls[0]
+    assert tool_call.function.name == "read_pdf"
+    assert json.loads(tool_call.function.arguments) == {"page": 1}
+
+
 def test_no_double_serialization_string_args(qwen3_tool_parser):
     """Regression: string arguments must not be double-serialized (PR #35615)."""
     tools = [
