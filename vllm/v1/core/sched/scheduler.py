@@ -385,6 +385,8 @@ class Scheduler(SchedulerInterface):
             trace_alloc_no_encoder = 0
             trace_alloc_no_mamba_split = 0
             trace_mamba_split_needed = 0
+            trace_alloc_same_full_block = 0
+            trace_alloc_candidate_state_unchanged = 0
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -507,24 +509,25 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens == 1
                     and request.num_computed_tokens == request.num_tokens - 1
                 )
-                trace_alloc_decode_one_token += int(is_decode_one_token)
                 block_size = self.block_size
+                next_num_computed_tokens = (
+                    request.num_computed_tokens + num_new_tokens
+                )
                 same_kv_block = (
                     request.num_computed_tokens > 0
                     and (
                         (request.num_computed_tokens + block_size - 1) // block_size
                     )
                     == (
-                        (
-                            request.num_computed_tokens
-                            + num_new_tokens
-                            + block_size
-                            - 1
-                        )
-                        // block_size
+                        (next_num_computed_tokens + block_size - 1) // block_size
                     )
                 )
                 trace_alloc_same_block += int(same_kv_block)
+                same_full_block = (
+                    request.num_computed_tokens // block_size
+                    == next_num_computed_tokens // block_size
+                )
+                trace_alloc_same_full_block += int(same_full_block)
                 no_spec_lookahead = (
                     self.num_lookahead_tokens == 0 and not request.spec_token_ids
                 )
@@ -536,6 +539,7 @@ class Scheduler(SchedulerInterface):
                 trace_alloc_candidate = (
                     is_decode_one_token
                     and same_kv_block
+                    and same_full_block
                     and not mamba_split_needed
                     and no_spec_lookahead
                     and no_encoder_work
@@ -543,6 +547,14 @@ class Scheduler(SchedulerInterface):
                     and not self.is_encoder_decoder
                 )
                 trace_alloc_candidates += int(trace_alloc_candidate)
+                trace_alloc_before_block_ids = None
+                if trace_alloc_candidate:
+                    trace_alloc_before_block_ids = tuple(
+                        tuple(block.block_id for block in group)
+                        for group in self.kv_cache_manager.get_blocks(
+                            request.request_id
+                        )
+                    )
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
@@ -569,6 +581,17 @@ class Scheduler(SchedulerInterface):
                                 )
                             else:
                                 trace_alloc_non_empty += 1
+                            if trace_alloc_candidate:
+                                trace_alloc_after_block_ids = tuple(
+                                    tuple(block.block_id for block in group)
+                                    for group in self.kv_cache_manager.get_blocks(
+                                        request.request_id
+                                    )
+                                )
+                                trace_alloc_candidate_state_unchanged += int(
+                                    trace_alloc_before_block_ids
+                                    == trace_alloc_after_block_ids
+                                )
                         # The request can be scheduled.
                         break
 
@@ -1128,10 +1151,11 @@ class Scheduler(SchedulerInterface):
                 "alloc_ms=%.3f alloc_calls=%d alloc_none=%d "
                 "alloc_empty=%d alloc_non_empty=%d "
                 "alloc_candidates=%d alloc_candidate_empty=%d "
+                "alloc_candidate_state_unchanged=%d "
                 "alloc_one_token=%d alloc_decode_one_token=%d "
-                "alloc_same_block=%d alloc_no_spec_lookahead=%d "
-                "alloc_no_encoder=%d alloc_no_mamba_split=%d "
-                "mamba_split_needed=%d",
+                "alloc_same_block=%d alloc_same_full_block=%d "
+                "alloc_no_spec_lookahead=%d alloc_no_encoder=%d "
+                "alloc_no_mamba_split=%d mamba_split_needed=%d",
                 trace_step,
                 (time.perf_counter() - trace_start) * 1000,
                 trace_new_step_ms,
@@ -1169,9 +1193,11 @@ class Scheduler(SchedulerInterface):
                 trace_alloc_non_empty,
                 trace_alloc_candidates,
                 trace_alloc_candidate_empty,
+                trace_alloc_candidate_state_unchanged,
                 trace_alloc_one_token,
                 trace_alloc_decode_one_token,
                 trace_alloc_same_block,
+                trace_alloc_same_full_block,
                 trace_alloc_no_spec_lookahead,
                 trace_alloc_no_encoder,
                 trace_alloc_no_mamba_split,
