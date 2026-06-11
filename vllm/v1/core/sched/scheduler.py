@@ -371,6 +371,20 @@ class Scheduler(SchedulerInterface):
             trace_running_before = len(self.running)
             trace_waiting_before = len(self.waiting)
             trace_skipped_waiting_before = len(self.skipped_waiting)
+            trace_alloc_ms = 0.0
+            trace_alloc_calls = 0
+            trace_alloc_none = 0
+            trace_alloc_empty = 0
+            trace_alloc_non_empty = 0
+            trace_alloc_candidates = 0
+            trace_alloc_candidate_empty = 0
+            trace_alloc_one_token = 0
+            trace_alloc_decode_one_token = 0
+            trace_alloc_same_block = 0
+            trace_alloc_no_spec_lookahead = 0
+            trace_alloc_no_encoder = 0
+            trace_alloc_no_mamba_split = 0
+            trace_mamba_split_needed = 0
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -456,9 +470,15 @@ class Scheduler(SchedulerInterface):
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
 
-            if self._needs_mamba_block_aligned_split(
+            mamba_split_needed = self._needs_mamba_block_aligned_split(
                 request, request.num_computed_tokens
-            ):
+            )
+            if trace_enabled:
+                if mamba_split_needed:
+                    trace_mamba_split_needed += 1
+                else:
+                    trace_alloc_no_mamba_split += 1
+            if mamba_split_needed:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
@@ -481,18 +501,79 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if trace_enabled:
+                trace_alloc_one_token += int(num_new_tokens == 1)
+                is_decode_one_token = (
+                    num_new_tokens == 1
+                    and request.num_computed_tokens == request.num_tokens - 1
+                )
+                trace_alloc_decode_one_token += int(is_decode_one_token)
+                block_size = self.block_size
+                same_kv_block = (
+                    request.num_computed_tokens > 0
+                    and (
+                        (request.num_computed_tokens + block_size - 1) // block_size
+                    )
+                    == (
+                        (
+                            request.num_computed_tokens
+                            + num_new_tokens
+                            + block_size
+                            - 1
+                        )
+                        // block_size
+                    )
+                )
+                trace_alloc_same_block += int(same_kv_block)
+                no_spec_lookahead = (
+                    self.num_lookahead_tokens == 0 and not request.spec_token_ids
+                )
+                trace_alloc_no_spec_lookahead += int(no_spec_lookahead)
+                no_encoder_work = not (
+                    encoder_inputs_to_schedule or external_load_encoder_input
+                )
+                trace_alloc_no_encoder += int(no_encoder_work)
+                trace_alloc_candidate = (
+                    is_decode_one_token
+                    and same_kv_block
+                    and not mamba_split_needed
+                    and no_spec_lookahead
+                    and no_encoder_work
+                    and self.connector is None
+                    and not self.is_encoder_decoder
+                )
+                trace_alloc_candidates += int(trace_alloc_candidate)
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
+                    if trace_enabled:
+                        trace_alloc_calls += 1
+                        trace_alloc_start = time.perf_counter()
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
+                    if trace_enabled:
+                        trace_alloc_ms += (
+                            time.perf_counter() - trace_alloc_start
+                        ) * 1000
 
                     if new_blocks is not None:
+                        if trace_enabled:
+                            if new_blocks.is_empty():
+                                trace_alloc_empty += 1
+                                trace_alloc_candidate_empty += int(
+                                    trace_alloc_candidate
+                                )
+                            else:
+                                trace_alloc_non_empty += 1
                         # The request can be scheduled.
                         break
+
+                    if trace_enabled:
+                        trace_alloc_none += 1
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -1043,7 +1124,14 @@ class Scheduler(SchedulerInterface):
                 "scheduled_new=%d scheduled_resumed=%d preempted=%d "
                 "scheduled_reqs=%d total_tokens=%d all_one_token=%s "
                 "decode_only=%s token_budget_left=%d encoder_reqs=%d "
-                "encoder_items=%d spec_reqs=%d structured_output=%s",
+                "encoder_items=%d spec_reqs=%d structured_output=%s "
+                "alloc_ms=%.3f alloc_calls=%d alloc_none=%d "
+                "alloc_empty=%d alloc_non_empty=%d "
+                "alloc_candidates=%d alloc_candidate_empty=%d "
+                "alloc_one_token=%d alloc_decode_one_token=%d "
+                "alloc_same_block=%d alloc_no_spec_lookahead=%d "
+                "alloc_no_encoder=%d alloc_no_mamba_split=%d "
+                "mamba_split_needed=%d",
                 trace_step,
                 (time.perf_counter() - trace_start) * 1000,
                 trace_new_step_ms,
@@ -1074,6 +1162,20 @@ class Scheduler(SchedulerInterface):
                 sum(len(v) for v in scheduled_encoder_inputs.values()),
                 len(scheduled_spec_decode_tokens),
                 scheduler_output.has_structured_output_requests,
+                trace_alloc_ms,
+                trace_alloc_calls,
+                trace_alloc_none,
+                trace_alloc_empty,
+                trace_alloc_non_empty,
+                trace_alloc_candidates,
+                trace_alloc_candidate_empty,
+                trace_alloc_one_token,
+                trace_alloc_decode_one_token,
+                trace_alloc_same_block,
+                trace_alloc_no_spec_lookahead,
+                trace_alloc_no_encoder,
+                trace_alloc_no_mamba_split,
+                trace_mamba_split_needed,
             )
         return scheduler_output
 
