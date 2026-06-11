@@ -3926,6 +3926,77 @@ def test_mamba_split_guard_matches_original_no_op_predicate():
     assert scheduler._mamba_block_aligned_split(request, 3) == 3
 
 
+def test_decode_allocation_fast_path_skips_only_state_noop_steps():
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        block_size=4,
+        enable_prefix_caching=True,
+        max_num_batched_tokens=64,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=16,
+        ignore_eos=True,
+        block_size=4,
+    )[0]
+    scheduler.add_request(request)
+
+    def update_with_token(output: SchedulerOutput, token_id: int) -> None:
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[token_id]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    prefill_output = scheduler.schedule()
+    update_with_token(prefill_output, 1)
+
+    coordinator = scheduler.kv_cache_manager.coordinator
+    coordinator.remove_skipped_blocks = Mock(wraps=coordinator.remove_skipped_blocks)
+    coordinator.allocate_new_blocks = Mock(wraps=coordinator.allocate_new_blocks)
+    coordinator.cache_blocks = Mock(wraps=coordinator.cache_blocks)
+
+    first_decode_output = scheduler.schedule()
+
+    # The first post-prefill decode must still run the normal allocator: it is
+    # the first chance to retire skipped blocks after prefill.
+    coordinator.remove_skipped_blocks.assert_called()
+    assert first_decode_output.scheduled_cached_reqs.new_block_ids != [None]
+    update_with_token(first_decode_output, 2)
+
+    coordinator.remove_skipped_blocks.reset_mock()
+    coordinator.allocate_new_blocks.reset_mock()
+    coordinator.cache_blocks.reset_mock()
+
+    fast_path_output = scheduler.schedule()
+
+    assert fast_path_output.scheduled_cached_reqs.new_block_ids == [None]
+    coordinator.remove_skipped_blocks.assert_not_called()
+    coordinator.allocate_new_blocks.assert_not_called()
+    coordinator.cache_blocks.assert_not_called()
+    update_with_token(fast_path_output, 3)
+
+    # Advance to the token before a full block is complete; caching that block is
+    # a real side effect, so the fast path must not take it.
+    update_with_token(scheduler.schedule(), 4)
+    coordinator.remove_skipped_blocks.reset_mock()
+    coordinator.allocate_new_blocks.reset_mock()
+    coordinator.cache_blocks.reset_mock()
+
+    cache_boundary_output = scheduler.schedule()
+
+    assert cache_boundary_output.scheduled_cached_reqs.new_block_ids == [None]
+    coordinator.remove_skipped_blocks.assert_called_once()
+    coordinator.cache_blocks.assert_called_once()
+
+
 def test_abort_request_waiting_for_remote_kvs():
     scheduler = create_scheduler(use_kv_connector=True)
 

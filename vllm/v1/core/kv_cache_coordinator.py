@@ -208,6 +208,13 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.cache_blocks(request, num_computed_tokens)
 
+    def needs_cache_blocks(self, request: Request, num_computed_tokens: int) -> bool:
+        return any(
+            manager.needs_cache_blocks(request, num_computed_tokens)
+            for manager in self.single_type_managers
+        )
+
+
     def free(self, request_id: str) -> None:
         """
         Free the blocks for the request.
@@ -499,6 +506,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 num_computed_tokens,
                 alignment_tokens=self.lcm_block_size,
             )
+
+    def needs_cache_blocks(self, request: Request, num_computed_tokens: int) -> bool:
+        num_computed_tokens = (
+            num_computed_tokens // self.lcm_block_size * self.lcm_block_size
+        )
+        return any(
+            manager.needs_cache_blocks(
+                request,
+                num_computed_tokens,
+                alignment_tokens=self.lcm_block_size,
+            )
+            for manager in self.single_type_managers
+        )
+
 
     def find_longest_cache_hit(
         self,

@@ -172,6 +172,8 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        self._last_allocated_computed_tokens: dict[str, int] = {}
+
 
     @property
     def usage(self) -> float:
@@ -235,6 +237,73 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _record_successful_allocation(
+        self, request: Request, blocks: tuple[list[KVCacheBlock], ...]
+    ) -> KVCacheBlocks:
+        self._last_allocated_computed_tokens[request.request_id] = (
+            request.num_computed_tokens
+        )
+        return self.create_kv_cache_blocks(blocks)
+
+    def _can_skip_running_decode_allocation(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        new_computed_block_list: tuple[Sequence[KVCacheBlock], ...],
+        num_new_computed_tokens: int,
+        num_external_computed_tokens: int,
+        num_lookahead_tokens: int,
+        num_encoder_tokens: int,
+        delay_cache_blocks: bool,
+        full_sequence_must_fit: bool,
+    ) -> bool:
+        if (
+            num_new_tokens != 1
+            or num_new_computed_tokens != 0
+            or any(new_computed_block_list)
+            or num_external_computed_tokens != 0
+            or num_lookahead_tokens != 0
+            or num_encoder_tokens != 0
+            or delay_cache_blocks
+            or full_sequence_must_fit
+        ):
+            return False
+
+        request_id = request.request_id
+        total_computed_tokens = request.num_computed_tokens
+        if (
+            total_computed_tokens <= 0
+            or self._last_allocated_computed_tokens.get(request_id)
+            != total_computed_tokens - 1
+        ):
+            return False
+
+        prev_computed_tokens = total_computed_tokens - 1
+        for manager in self.coordinator.single_type_managers:
+            if manager.get_num_skipped_blocks(
+                request_id, total_computed_tokens
+            ) != manager.get_num_skipped_blocks(request_id, prev_computed_tokens):
+                return False
+
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_need_slot = min(num_tokens_main_model, self.max_model_len)
+        if self.coordinator.get_num_blocks_to_allocate(
+            request_id=request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=0,
+            total_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+        ):
+            return False
+
+        if self.enable_caching:
+            num_tokens_to_cache = min(num_tokens_main_model, request.num_tokens)
+            if self.coordinator.needs_cache_blocks(request, num_tokens_to_cache):
+                return False
+
+        return True
 
     def allocate_slots(
         self,
@@ -335,6 +404,21 @@ class KVCacheManager:
             new_computed_block_list = new_computed_blocks.blocks
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
+        if self._can_skip_running_decode_allocation(
+            request,
+            num_new_tokens,
+            new_computed_block_list,
+            num_new_computed_tokens,
+            num_external_computed_tokens,
+            num_lookahead_tokens,
+            num_encoder_tokens,
+            delay_cache_blocks,
+            full_sequence_must_fit,
+        ):
+            self._last_allocated_computed_tokens[request.request_id] = (
+                request.num_computed_tokens
+            )
+            return self.empty_kv_cache_blocks
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
@@ -414,7 +498,7 @@ class KVCacheManager:
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
-            return self.create_kv_cache_blocks(new_blocks)
+            return self._record_successful_allocation(request, new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
         # + num_external_computed_tokens + num_new_tokens, but must exclude
@@ -427,7 +511,7 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
-        return self.create_kv_cache_blocks(new_blocks)
+        return self._record_successful_allocation(request, new_blocks)
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -437,6 +521,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self._last_allocated_computed_tokens.pop(request.request_id, None)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

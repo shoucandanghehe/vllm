@@ -417,6 +417,17 @@ class SingleTypeKVCacheManager(ABC):
 
         raise NotImplementedError
 
+    def needs_cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        alignment_tokens: int | None = None,
+    ) -> bool:
+        """Return whether cache_blocks() would cache any new full block."""
+        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+        num_full_blocks = num_tokens // self.block_size
+        return num_cached_blocks < num_full_blocks
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
@@ -433,20 +444,16 @@ class SingleTypeKVCacheManager(ABC):
                 local computed tokens and external computed tokens.
         """
         # Remove the blocks that will be skipped during attention computation.
-        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
-        if num_skipped_tokens <= 0:
+        num_skipped_blocks = self.get_num_skipped_blocks(
+            request_id, total_computed_tokens
+        )
+        if num_skipped_blocks <= 0:
             # This indicates that ALL tokens are inside attention window.
             # Thus we do not need to free any blocks outside attention window.
             # A typical case is full attention that we never free any token
             # before the request is finished.
             return
         blocks = self.req_to_blocks[request_id]
-        num_skipped_blocks = num_skipped_tokens // self.block_size
-        # `num_skipped_tokens` may include tokens that haven't been allocated yet
-        # (e.g., when the attention window moves into the external computed tokens
-        # range), so we must cap to the number of blocks that currently exist for
-        # this request.
-        num_skipped_blocks = min(num_skipped_blocks, len(blocks))
         removed_blocks: list[KVCacheBlock] = []
         # Because the block starts from index 0, the num_skipped_block-th block
         # corresponds to index num_skipped_blocks - 1.
@@ -459,6 +466,18 @@ class SingleTypeKVCacheManager(ABC):
             removed_blocks.append(blocks[i])
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
+
+    def get_num_skipped_blocks(
+        self, request_id: str, total_computed_tokens: int
+    ) -> int:
+        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+        if num_skipped_tokens <= 0:
+            return 0
+        return min(
+            num_skipped_tokens // self.block_size,
+            len(self.req_to_blocks[request_id]),
+        )
+
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -901,6 +920,16 @@ class MambaManager(SingleTypeKVCacheManager):
                 break  # we just need the last match - early stopping
 
         return computed_blocks
+
+    def get_num_skipped_blocks(
+        self, request_id: str, total_computed_tokens: int
+    ) -> int:
+        # Match remove_skipped_blocks(): draft/speculative state blocks are not
+        # safe to free until the tokens are accepted.
+        return super().get_num_skipped_blocks(
+            request_id,
+            max(0, total_computed_tokens - self.num_speculative_blocks),
+        )
 
     def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
