@@ -4,6 +4,7 @@
 import asyncio
 import io
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -657,6 +658,8 @@ class OpenAIServingChat(OpenAIServing):
 
                     delta_message: DeltaMessage | None
 
+                    trace_raw_tool = False
+
                     # just update previous_texts and previous_token_ids
                     if (
                         is_mistral_grammar_path
@@ -677,6 +680,41 @@ class OpenAIServingChat(OpenAIServing):
                             )
                         else:
                             current_token_ids = as_list(output.token_ids)
+                        trace_raw_tool = (
+                            bool(os.getenv("VLLM_TOOL_RAW_TRACE_DIR"))
+                            and not self.use_harmony
+                        )
+                        if trace_raw_tool:
+                            delta_text_trace, delta_text_truncated = (
+                                self._trim_tool_raw_trace_text(delta_text)
+                            )
+                            current_text_trace, current_text_truncated = (
+                                self._trim_tool_raw_trace_text(current_text)
+                            )
+                            self._trace_tool_raw_event(
+                                "stream_pre_parse",
+                                request_id,
+                                choice_index=i,
+                                finish_reason=output.finish_reason,
+                                stop_reason=output.stop_reason,
+                                delta_text=delta_text_trace,
+                                delta_text_truncated=delta_text_truncated,
+                                current_text=current_text_trace,
+                                current_text_truncated=current_text_truncated,
+                                delta_token_ids=self._trim_tool_raw_trace_tokens(
+                                    as_list(output.token_ids)
+                                ),
+                                current_token_ids=self._trim_tool_raw_trace_tokens(
+                                    current_token_ids
+                                ),
+                                parser=parser.__class__.__name__
+                                if parser is not None
+                                else None,
+                                reasoning_parser=reasoning_parser.__class__.__name__
+                                if reasoning_parser is not None
+                                else None,
+                            )
+
 
                     if self.use_harmony:
                         delta_message, tools_streamed_flag = (
@@ -729,6 +767,30 @@ class OpenAIServingChat(OpenAIServing):
                     # handle streaming just a content delta (no parsers)
                     else:
                         delta_message = DeltaMessage(content=delta_text)
+
+                    if trace_raw_tool:
+                        content_trace, content_truncated = (
+                            self._trim_tool_raw_trace_text(
+                                None if delta_message is None else delta_message.content
+                            )
+                        )
+                        self._trace_tool_raw_event(
+                            "stream_post_parse",
+                            request_id,
+                            choice_index=i,
+                            finish_reason=output.finish_reason,
+                            stop_reason=output.stop_reason,
+                            content=content_trace,
+                            content_truncated=content_truncated,
+                            reasoning=None
+                            if delta_message is None
+                            else delta_message.reasoning,
+                            tool_calls=self._tool_raw_trace_tool_calls(
+                                None
+                                if delta_message is None
+                                else delta_message.tool_calls
+                            ),
+                        )
 
                     # update the previous values for the next iteration
                     if (
@@ -878,6 +940,24 @@ class OpenAIServingChat(OpenAIServing):
                             delta_message = self._create_remaining_args_delta(
                                 delta_message, remaining_call, index
                             )
+                        if trace_raw_tool:
+                            content_trace, content_truncated = (
+                                self._trim_tool_raw_trace_text(delta_message.content)
+                            )
+                            self._trace_tool_raw_event(
+                                "stream_finish_delta",
+                                request_id,
+                                choice_index=i,
+                                finish_reason=output.finish_reason,
+                                stop_reason=output.stop_reason,
+                                content=content_trace,
+                                content_truncated=content_truncated,
+                                reasoning=delta_message.reasoning,
+                                tool_calls=self._tool_raw_trace_tool_calls(
+                                    delta_message.tool_calls
+                                ),
+                            )
+
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -993,6 +1073,25 @@ class OpenAIServingChat(OpenAIServing):
                         is_streaming=True,
                         delta=False,
                     )
+            if os.getenv("VLLM_TOOL_RAW_TRACE_DIR"):
+                for i in range(num_choices):
+                    full_text = (
+                        previous_texts[i]
+                        if previous_texts and i < len(previous_texts)
+                        else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                    )
+                    full_text_trace, full_text_truncated = (
+                        self._trim_tool_raw_trace_text(full_text)
+                    )
+                    self._trace_tool_raw_event(
+                        "stream_final_raw",
+                        request_id,
+                        choice_index=i,
+                        finish_reason="streaming_complete",
+                        full_text=full_text_trace,
+                        full_text_truncated=full_text_truncated,
+                    )
+
 
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
@@ -1056,6 +1155,25 @@ class OpenAIServingChat(OpenAIServing):
                 )
             else:
                 logprobs = None
+            if os.getenv("VLLM_TOOL_RAW_TRACE_DIR"):
+                raw_text_trace, raw_text_truncated = self._trim_tool_raw_trace_text(
+                    output.text
+                )
+                self._trace_tool_raw_event(
+                    "nonstream_pre_parse",
+                    request_id,
+                    choice_index=output.index,
+                    finish_reason=output.finish_reason,
+                    stop_reason=output.stop_reason,
+                    raw_text=raw_text_trace,
+                    raw_text_truncated=raw_text_truncated,
+                    token_ids=self._trim_tool_raw_trace_tokens(as_list(token_ids)),
+                    tool_parser=self.tool_parser.__name__ if self.tool_parser else None,
+                    reasoning_parser=reasoning_parser.__class__.__name__
+                    if reasoning_parser is not None
+                    else None,
+                )
+
 
             if self.use_harmony:
                 reasoning, content, _ = parse_chat_output(token_ids)
@@ -1133,6 +1251,21 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning = None
                 content = output.text
 
+            if os.getenv("VLLM_TOOL_RAW_TRACE_DIR"):
+                content_before_tool_trace, content_before_tool_truncated = (
+                    self._trim_tool_raw_trace_text(content)
+                )
+                self._trace_tool_raw_event(
+                    "nonstream_after_reasoning",
+                    request_id,
+                    choice_index=output.index,
+                    finish_reason=output.finish_reason,
+                    stop_reason=output.stop_reason,
+                    content=content_before_tool_trace,
+                    content_truncated=content_before_tool_truncated,
+                    reasoning=reasoning,
+                )
+
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
@@ -1143,6 +1276,21 @@ class OpenAIServingChat(OpenAIServing):
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+            if os.getenv("VLLM_TOOL_RAW_TRACE_DIR"):
+                content_after_tool_trace, content_after_tool_truncated = (
+                    self._trim_tool_raw_trace_text(content)
+                )
+                self._trace_tool_raw_event(
+                    "nonstream_post_parse",
+                    request_id,
+                    choice_index=output.index,
+                    finish_reason=output.finish_reason,
+                    stop_reason=output.stop_reason,
+                    content=content_after_tool_trace,
+                    content_truncated=content_after_tool_truncated,
+                    tool_calls=self._tool_raw_trace_tool_calls(tool_calls),
+                )
+
             if is_mistral_tokenizer(tokenizer):
                 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 
@@ -1596,3 +1744,94 @@ class OpenAIServingChat(OpenAIServing):
                 )
             ]
         )
+    @staticmethod
+    def _trim_tool_raw_trace_text(text: str | None) -> tuple[str | None, bool]:
+        if text is None:
+            return None, False
+        try:
+            max_chars = int(os.getenv("VLLM_TOOL_RAW_TRACE_MAX_CHARS", "65536"))
+        except ValueError:
+            max_chars = 65536
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text, False
+        half = max_chars // 2
+        return (
+            text[:half]
+            + "\n...<vllm-tool-raw-trace-truncated>...\n"
+            + text[-half:],
+            True,
+        )
+
+    @staticmethod
+    def _trim_tool_raw_trace_tokens(
+        tokens: GenericSequence[int] | None,
+    ) -> list[int] | None:
+        if tokens is None:
+            return None
+        try:
+            max_tokens = int(os.getenv("VLLM_TOOL_RAW_TRACE_MAX_TOKENS", "4096"))
+        except ValueError:
+            max_tokens = 4096
+        token_list = list(tokens)
+        if max_tokens <= 0 or len(token_list) <= max_tokens:
+            return token_list
+        half = max_tokens // 2
+        return token_list[:half] + token_list[-half:]
+
+    @classmethod
+    def _tool_raw_trace_tool_calls(
+        cls, tool_calls: GenericSequence[Any] | None
+    ) -> list[dict[str, Any]]:
+        traced_tool_calls: list[dict[str, Any]] = []
+        if not tool_calls:
+            return traced_tool_calls
+        for tool_call in tool_calls:
+            function = getattr(tool_call, "function", None)
+            if function is None and hasattr(tool_call, "arguments"):
+                function_name = getattr(tool_call, "name", None)
+                function_arguments = getattr(tool_call, "arguments", None)
+            elif function is not None:
+                function_name = function.name
+                function_arguments = function.arguments
+            else:
+                function_name = None
+                function_arguments = None
+
+            arguments, arguments_truncated = cls._trim_tool_raw_trace_text(
+                function_arguments
+            )
+            traced_tool_calls.append(
+                {
+                    "index": getattr(tool_call, "index", None),
+                    "id": getattr(tool_call, "id", None),
+                    "type": getattr(tool_call, "type", None),
+                    "function": {
+                        "name": function_name,
+                        "arguments": arguments,
+                        "arguments_truncated": arguments_truncated,
+                    },
+                }
+            )
+        return traced_tool_calls
+
+    def _trace_tool_raw_event(
+        self, event: str, request_id: str, **payload: Any
+    ) -> None:
+        trace_dir = os.getenv("VLLM_TOOL_RAW_TRACE_DIR")
+        if not trace_dir:
+            return
+        try:
+            os.makedirs(trace_dir, exist_ok=True)
+            record = {
+                "time": time.time(),
+                "event": event,
+                "request_id": request_id,
+                **payload,
+            }
+            path = os.path.join(trace_dir, f"{request_id}.jsonl")
+            with open(path, "a", encoding="utf-8") as trace_file:
+                json.dump(record, trace_file, ensure_ascii=False, default=str)
+                trace_file.write("\n")
+        except Exception:
+            logger.exception("Failed to write raw tool trace for %s", request_id)
+
