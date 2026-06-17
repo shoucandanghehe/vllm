@@ -20,6 +20,7 @@ from vllm.distributed.weight_transfer.base import (
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient, StreamingInput
+from vllm.entrypoints.openai.frontend_trace import get_frontend_trace
 from vllm.entrypoints.serve.elastic_ep.middleware import set_scaling_elastic_ep
 from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
@@ -408,6 +409,7 @@ class AsyncLLM(EngineClient):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
+        get_frontend_trace().engine_add(request.request_id)
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
 
