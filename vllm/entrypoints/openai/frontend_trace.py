@@ -111,15 +111,32 @@ class FrontendTrace:
                 }
             )
 
+    def _pop_active_unlocked(
+        self,
+        request_id: str,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        active = self._active.pop(request_id, None)
+        if active is not None:
+            return request_id, active
+
+        # InputProcessor may append an internal suffix to request ids before
+        # they reach EngineCore. Match the OpenAI request id prefix so the
+        # frontend span closes when that internal request is submitted.
+        for active_id in tuple(self._active):
+            if request_id.startswith(active_id + "-"):
+                return active_id, self._active.pop(active_id)
+        return None, None
+
     def engine_add(self, request_id: str) -> None:
         if not self.enabled:
             return
         now = time.perf_counter()
         with self._lock:
-            active = self._active.pop(request_id, None)
+            frontend_request_id, active = self._pop_active_unlocked(request_id)
             row: dict[str, Any] = {
                 "event": "engine_add",
                 "request_id": request_id,
+                "frontend_request_id": frontend_request_id,
                 "active_frontend": len(self._active),
             }
             if active is not None:
