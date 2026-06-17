@@ -48,6 +48,7 @@ from vllm.entrypoints.openai.engine.serving import (
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
+from vllm.entrypoints.openai.frontend_trace import get_frontend_trace
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
@@ -234,21 +235,41 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        request_id = (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
+        trace = get_frontend_trace()
+        trace.request_start(
+            request_id,
+            endpoint="chat.completions",
+            stream=request.stream,
+            max_tokens=request.max_tokens,
+        )
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
             reasoning_parser = self.reasoning_parser_cls(
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
-        result = await self.render_chat_request(request)
+        render_start = time.perf_counter()
+        try:
+            result = await self.render_chat_request(request)
+        except Exception as exc:
+            trace.finish(
+                request_id,
+                "render_exception",
+                render_s=time.perf_counter() - render_start,
+                error=repr(exc),
+            )
+            raise
+        render_s = time.perf_counter() - render_start
+        trace.stage(request_id, "render_done", render_s=render_s)
         if isinstance(result, ErrorResponse):
+            trace.finish(request_id, "render_error", render_s=render_s)
             return result
 
         conversation, engine_inputs = result
 
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
